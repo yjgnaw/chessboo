@@ -1,2 +1,9 @@
 /target
+/training
+/nets
+/docs
+/scripts
 config.json
+run_*.bin
+*.txt
+RELEASE_NOTES.md

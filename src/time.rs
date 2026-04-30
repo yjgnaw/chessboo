@@ -1,13 +1,13 @@
 use std::time::{Duration, Instant};
 
-use cozy_chess::Color;
+use shakmaty::Color;
 
 const MIN_SEARCH_MS: u64 = 1;
-const DEFAULT_MOVES_TO_GO: u32 = 28;
-const INCREMENT_USAGE_NUMERATOR: u64 = 7;
-const INCREMENT_USAGE_DENOMINATOR: u64 = 10;
-const HARD_BUDGET_NUMERATOR: u64 = 5;
-const HARD_BUDGET_DENOMINATOR: u64 = 2;
+const MAX_MOVES_TO_GO: u32 = 50;
+const LOW_TIME_MOVES_TO_GO_NUMERATOR: u64 = 5;
+const LOW_TIME_MOVES_TO_GO_DENOMINATOR: u64 = 100;
+const MAXIMUM_TIME_NUMERATOR: u64 = 8097;
+const MAXIMUM_TIME_DENOMINATOR: u64 = 10_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct TimeControl {
@@ -21,6 +21,7 @@ pub struct TimeControl {
     pub black_increment: Option<Duration>,
     pub moves_to_go: Option<u32>,
     pub move_overhead: Duration,
+    pub ply: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,7 @@ impl TimeControl {
             increment,
             self.moves_to_go,
             self.move_overhead,
+            self.ply,
         ))
     }
 }
@@ -91,38 +93,92 @@ fn clock_budget(
     increment: Duration,
     moves_to_go: Option<u32>,
     overhead: Duration,
+    ply: u32,
 ) -> SearchBudget {
-    let safe_ms = duration_ms(reserve_overhead(remaining, overhead));
+    let remaining_ms = duration_ms(remaining);
     let increment_ms = duration_ms(increment);
-    let moves = moves_to_go.unwrap_or(DEFAULT_MOVES_TO_GO).clamp(1, 80) as u64;
+    let overhead_ms = duration_ms(overhead);
+    let moves = stockfish_moves_to_go(remaining_ms, moves_to_go);
+    let time_left_ms = stockfish_time_left(remaining_ms, increment_ms, overhead_ms, moves);
+    let (opt_scale, max_scale) =
+        stockfish_scales(remaining_ms, time_left_ms, moves_to_go, ply, moves);
 
-    let base_ms = safe_ms / moves;
-    let increment_part_ms =
-        increment_ms.saturating_mul(INCREMENT_USAGE_NUMERATOR) / INCREMENT_USAGE_DENOMINATOR;
-    let mut soft_ms = base_ms.saturating_add(increment_part_ms);
-    let max_soft_ms = if moves <= 2 {
-        safe_ms.saturating_mul(85) / 100
-    } else {
-        safe_ms.saturating_mul(35) / 100 + increment_ms
-    };
-    soft_ms = soft_ms.clamp(MIN_SEARCH_MS, max_soft_ms.max(MIN_SEARCH_MS));
+    let maximum_current_ms = remaining_ms
+        .saturating_mul(MAXIMUM_TIME_NUMERATOR)
+        .saturating_div(MAXIMUM_TIME_DENOMINATOR)
+        .saturating_sub(overhead_ms)
+        .max(MIN_SEARCH_MS);
 
-    let hard_scaled_ms = soft_ms.saturating_mul(HARD_BUDGET_NUMERATOR) / HARD_BUDGET_DENOMINATOR;
-    let hard_candidate_ms =
-        hard_scaled_ms.max(soft_ms.saturating_add(increment_ms / 3).saturating_add(20));
-    let hard_ms = if moves <= 2 {
-        safe_ms
-    } else {
-        hard_candidate_ms
-            .min(safe_ms.saturating_mul(7) / 10)
-            .min(safe_ms)
-    }
-    .max(soft_ms);
+    let soft_ms = scaled_time(time_left_ms, opt_scale)
+        .max(MIN_SEARCH_MS)
+        .min(maximum_current_ms);
+    let hard_ms = scaled_time(soft_ms, max_scale)
+        .max(soft_ms)
+        .min(maximum_current_ms);
 
     SearchBudget {
         soft: Duration::from_millis(soft_ms),
         hard: Duration::from_millis(hard_ms),
     }
+}
+
+fn stockfish_moves_to_go(remaining_ms: u64, moves_to_go: Option<u32>) -> u32 {
+    let mut moves = moves_to_go.unwrap_or(MAX_MOVES_TO_GO).min(MAX_MOVES_TO_GO);
+    if remaining_ms < 1000 {
+        moves = ((remaining_ms.saturating_mul(LOW_TIME_MOVES_TO_GO_NUMERATOR)
+            / LOW_TIME_MOVES_TO_GO_DENOMINATOR) as u32)
+            .max(1);
+    }
+    moves.max(1)
+}
+
+fn stockfish_time_left(
+    remaining_ms: u64,
+    increment_ms: u64,
+    overhead_ms: u64,
+    moves_to_go: u32,
+) -> u64 {
+    let moves = moves_to_go as u64;
+    remaining_ms
+        .saturating_add(increment_ms.saturating_mul(moves.saturating_sub(1)))
+        .saturating_sub(overhead_ms.saturating_mul(2 + moves))
+        .max(MIN_SEARCH_MS)
+}
+
+fn stockfish_scales(
+    remaining_ms: u64,
+    time_left_ms: u64,
+    moves_to_go: Option<u32>,
+    ply: u32,
+    moves: u32,
+) -> (f64, f64) {
+    let remaining = remaining_ms.max(MIN_SEARCH_MS) as f64;
+    let time_left = time_left_ms.max(MIN_SEARCH_MS) as f64;
+    let ply = ply as f64;
+
+    if moves_to_go.is_none() {
+        let original_time_adjust = 0.3272 * time_left.log10() - 0.4141;
+        let log_time_in_sec = (remaining / 1000.0).log10();
+        let opt_constant = (0.0029869 + 0.00033554 * log_time_in_sec).min(0.004905);
+        let max_constant = (3.3744 + 3.0608 * log_time_in_sec).max(3.1441);
+        let opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_constant)
+            .min(0.19404 * remaining / time_left)
+            * original_time_adjust;
+        let max_scale = (max_constant + ply / 12.352).min(6.873);
+        (opt_scale, max_scale)
+    } else {
+        let moves = moves as f64;
+        let opt_scale = ((0.88 + ply / 116.4) / moves).min(0.88 * remaining / time_left);
+        let max_scale = 1.3 + 0.11 * moves;
+        (opt_scale, max_scale)
+    }
+}
+
+fn scaled_time(time_ms: u64, scale: f64) -> u64 {
+    if !scale.is_finite() || scale <= 0.0 {
+        return MIN_SEARCH_MS;
+    }
+    (time_ms as f64 * scale).max(MIN_SEARCH_MS as f64) as u64
 }
 
 fn reserve_overhead(duration: Duration, overhead: Duration) -> Duration {
@@ -166,8 +222,8 @@ mod tests {
         };
 
         let budget = tc.budget(Color::White).unwrap();
-        assert_eq!(budget.soft, Duration::from_millis(69));
-        assert_eq!(budget.hard, Duration::from_millis(172));
+        assert_eq!(budget.soft, Duration::from_millis(25));
+        assert_eq!(budget.hard, Duration::from_millis(84));
         assert!(budget.hard > budget.soft);
         assert!(budget.hard < Duration::from_millis(1000));
     }
@@ -183,13 +239,14 @@ mod tests {
         };
 
         let budget = tc.budget(Color::White).unwrap();
-        assert_eq!(budget.soft, Duration::from_millis(132));
+        assert_eq!(budget.soft, Duration::from_millis(101));
+        assert_eq!(budget.hard, Duration::from_millis(242));
         assert!(budget.hard > budget.soft);
         assert!(budget.hard < Duration::from_millis(1000));
     }
 
     #[test]
-    fn final_move_can_use_most_of_the_safe_clock() {
+    fn subsecond_clock_keeps_stockfish_overhead_reserve() {
         let tc = TimeControl {
             black_time: Some(Duration::from_millis(500)),
             black_increment: Some(Duration::from_millis(0)),
@@ -199,7 +256,21 @@ mod tests {
         };
 
         let budget = tc.budget(Color::Black).unwrap();
-        assert_eq!(budget.hard, Duration::from_millis(475));
-        assert!(budget.soft < budget.hard);
+        assert_eq!(budget.soft, Duration::from_millis(MIN_SEARCH_MS));
+        assert_eq!(budget.hard, Duration::from_millis(4));
+    }
+
+    #[test]
+    fn increment_usage_never_exceeds_overhead_reserved_clock() {
+        let tc = TimeControl {
+            white_time: Some(Duration::from_millis(5)),
+            white_increment: Some(Duration::from_millis(50)),
+            move_overhead: Duration::from_millis(25),
+            ..TimeControl::default()
+        };
+
+        let budget = tc.budget(Color::White).unwrap();
+        assert_eq!(budget.soft, Duration::from_millis(MIN_SEARCH_MS));
+        assert_eq!(budget.hard, Duration::from_millis(MIN_SEARCH_MS));
     }
 }

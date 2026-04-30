@@ -1,7 +1,4 @@
-use cozy_chess::{
-    BitBoard, Board, Color, File, Piece, Square, get_bishop_moves, get_king_moves,
-    get_knight_moves, get_pawn_attacks, get_rook_moves,
-};
+use shakmaty::{attacks, Bitboard as BitBoard, Board, Color, File, Rank, Role as Piece, Square};
 
 use crate::position::Position;
 
@@ -40,9 +37,9 @@ pub fn evaluate_board(board: &Board) -> i32 {
         let mut side = Score::default();
 
         for &piece in &Piece::ALL {
-            let count = board.colored_pieces(color, piece).len() as i32;
+            let count = colored_pieces(board, color, piece).count() as i32;
             phase += PHASE[piece_index(piece)] * count;
-            for square in board.colored_pieces(color, piece) {
+            for square in colored_pieces(board, color, piece) {
                 let idx = piece_index(piece);
                 side.mg += MG_VALUE[idx] + piece_square(piece, color, square).mg;
                 side.eg += EG_VALUE[idx] + piece_square(piece, color, square).eg;
@@ -64,6 +61,14 @@ pub fn piece_value(piece: Piece) -> i32 {
     MG_VALUE[piece_index(piece)]
 }
 
+fn colored_pieces(board: &Board, color: Color, piece: Piece) -> BitBoard {
+    board.by_color(color) & board.by_role(piece)
+}
+
+fn king_square(board: &Board, color: Color) -> Square {
+    board.king_of(color).expect("standard chess position has a king")
+}
+
 fn piece_index(piece: Piece) -> usize {
     match piece {
         Piece::Pawn => 0,
@@ -76,7 +81,7 @@ fn piece_index(piece: Piece) -> usize {
 }
 
 fn piece_square(piece: Piece, color: Color, square: Square) -> Score {
-    let file = square.file() as i32;
+    let file = square.file().to_u32() as i32;
     let rank = relative_rank(color, square);
     let file_center = 3 - (file - 3).abs().min((file - 4).abs());
     let center = file_center + (3 - (rank - 3).abs().min((rank - 4).abs()));
@@ -112,12 +117,12 @@ fn piece_square(piece: Piece, color: Color, square: Square) -> Score {
 
 fn pawn_structure(board: &Board, color: Color) -> Score {
     let mut score = Score::default();
-    let pawns = board.colored_pieces(color, Piece::Pawn);
-    let enemy_pawns = board.colored_pieces(!color, Piece::Pawn);
+    let pawns = colored_pieces(board, color, Piece::Pawn);
+    let enemy_pawns = colored_pieces(board, !color, Piece::Pawn);
 
     for file_idx in 0..8 {
-        let file = File::try_index(file_idx).expect("valid file");
-        let count = (pawns & file.bitboard()).len() as i32;
+        let file = File::new(file_idx);
+        let count = (pawns & BitBoard::from_file(file)).count() as i32;
         if count > 1 {
             score.mg -= 12 * (count - 1);
             score.eg -= 18 * (count - 1);
@@ -125,7 +130,7 @@ fn pawn_structure(board: &Board, color: Color) -> Score {
     }
 
     for pawn in pawns {
-        let file = pawn.file() as i32;
+        let file = pawn.file().to_u32() as i32;
         let rank = relative_rank(color, pawn);
 
         if !has_friendly_pawn_on_adjacent_file(board, color, file) {
@@ -144,33 +149,33 @@ fn pawn_structure(board: &Board, color: Color) -> Score {
 }
 
 fn piece_activity(board: &Board, color: Color) -> Score {
-    let own = board.colors(color);
+    let own = board.by_color(color);
     let blockers = board.occupied();
     let mut score = Score::default();
 
-    let bishops = board.colored_pieces(color, Piece::Bishop).len();
+    let bishops = colored_pieces(board, color, Piece::Bishop).count();
     if bishops >= 2 {
         score.mg += 32;
         score.eg += 48;
     }
 
-    for knight in board.colored_pieces(color, Piece::Knight) {
-        let mobility = (get_knight_moves(knight) & !own).len() as i32;
+    for knight in colored_pieces(board, color, Piece::Knight) {
+        let mobility = (attacks::knight_attacks(knight) & !own).count() as i32;
         score.mg += mobility * 4;
         score.eg += mobility * 3;
     }
-    for bishop in board.colored_pieces(color, Piece::Bishop) {
-        let mobility = (get_bishop_moves(bishop, blockers) & !own).len() as i32;
+    for bishop in colored_pieces(board, color, Piece::Bishop) {
+        let mobility = (attacks::bishop_attacks(bishop, blockers) & !own).count() as i32;
         score.mg += mobility * 5;
         score.eg += mobility * 4;
     }
-    for rook in board.colored_pieces(color, Piece::Rook) {
-        let mobility = (get_rook_moves(rook, blockers) & !own).len() as i32;
+    for rook in colored_pieces(board, color, Piece::Rook) {
+        let mobility = (attacks::rook_attacks(rook, blockers) & !own).count() as i32;
         score.mg += mobility * 2;
         score.eg += mobility * 3;
         let file = rook.file();
-        let friendly_pawns = board.colored_pieces(color, Piece::Pawn) & file.bitboard();
-        let enemy_pawns = board.colored_pieces(!color, Piece::Pawn) & file.bitboard();
+        let friendly_pawns = colored_pieces(board, color, Piece::Pawn) & BitBoard::from_file(file);
+        let enemy_pawns = colored_pieces(board, !color, Piece::Pawn) & BitBoard::from_file(file);
         if friendly_pawns.is_empty() && enemy_pawns.is_empty() {
             score.mg += 22;
             score.eg += 12;
@@ -179,10 +184,10 @@ fn piece_activity(board: &Board, color: Color) -> Score {
             score.eg += 6;
         }
     }
-    for queen in board.colored_pieces(color, Piece::Queen) {
-        let mobility = ((get_rook_moves(queen, blockers) | get_bishop_moves(queen, blockers))
+    for queen in colored_pieces(board, color, Piece::Queen) {
+        let mobility = ((attacks::rook_attacks(queen, blockers) | attacks::bishop_attacks(queen, blockers))
             & !own)
-            .len() as i32;
+            .count() as i32;
         score.mg += mobility;
         score.eg += mobility * 2;
     }
@@ -193,11 +198,11 @@ fn piece_activity(board: &Board, color: Color) -> Score {
 
 fn threats(board: &Board, color: Color) -> Score {
     let attacks = attacks_by(board, color);
-    let enemy = board.colors(!color);
+    let enemy = board.by_color(!color);
     let attacked = attacks & enemy;
     let mut score = Score::default();
     for square in attacked {
-        if let Some(piece) = board.piece_on(square)
+        if let Some(piece) = board.role_at(square)
             && piece != Piece::King
         {
             score.mg += piece_value(piece) / 18;
@@ -208,24 +213,22 @@ fn threats(board: &Board, color: Color) -> Score {
 }
 
 fn king_safety(board: &Board, color: Color) -> Score {
-    let king = board.king(color);
+    let king = king_square(board, color);
     let enemy_attacks = attacks_by(board, !color);
-    let king_zone = get_king_moves(king) | king.bitboard();
-    let attacked_zone = (enemy_attacks & king_zone).len() as i32;
+    let king_zone = attacks::king_attacks(king) | BitBoard::from_square(king);
+    let attacked_zone = (enemy_attacks & king_zone).count() as i32;
     let mut shield = 0;
     let forward_rank = match color {
-        Color::White => king.rank() as i32 + 1,
-        Color::Black => king.rank() as i32 - 1,
+        Color::White => king.rank().to_u32() as i32 + 1,
+        Color::Black => king.rank().to_u32() as i32 - 1,
     };
     if (0..8).contains(&forward_rank) {
-        let king_file = king.file() as i32;
+        let king_file = king.file().to_u32() as i32;
         for file in (king_file - 1)..=(king_file + 1) {
             if (0..8).contains(&file) {
-                let square = Square::new(
-                    File::try_index(file as usize).expect("valid file"),
-                    cozy_chess::Rank::try_index(forward_rank as usize).expect("valid rank"),
-                );
-                if board.colored_pieces(color, Piece::Pawn).has(square) {
+                let square =
+                    Square::from_coords(File::new(file as u32), Rank::new(forward_rank as u32));
+                if colored_pieces(board, color, Piece::Pawn).contains(square) {
                     shield += 1;
                 }
             }
@@ -245,8 +248,8 @@ fn mop_up(board: &Board, color: Color) -> Score {
         return Score::default();
     }
 
-    let own_king = board.king(color);
-    let enemy_king = board.king(!color);
+    let own_king = king_square(board, color);
+    let enemy_king = king_square(board, !color);
     let edge_distance = distance_to_edge(enemy_king);
     let edge_bonus = (6 - edge_distance).max(0);
     let king_distance = square_distance(own_king, enemy_king);
@@ -263,47 +266,48 @@ fn non_king_material(board: &Board, color: Color) -> i32 {
         .iter()
         .copied()
         .filter(|&piece| piece != Piece::King)
-        .map(|piece| EG_VALUE[piece_index(piece)] * board.colored_pieces(color, piece).len() as i32)
+        .map(|piece| EG_VALUE[piece_index(piece)] * colored_pieces(board, color, piece).count() as i32)
         .sum()
 }
 
 fn distance_to_edge(square: Square) -> i32 {
-    let file = square.file() as i32;
-    let rank = square.rank() as i32;
+    let file = square.file().to_u32() as i32;
+    let rank = square.rank().to_u32() as i32;
     file.min(7 - file) + rank.min(7 - rank)
 }
 
 fn square_distance(a: Square, b: Square) -> i32 {
-    (a.file() as i32 - b.file() as i32).abs() + (a.rank() as i32 - b.rank() as i32).abs()
+    (a.file().to_u32() as i32 - b.file().to_u32() as i32).abs()
+        + (a.rank().to_u32() as i32 - b.rank().to_u32() as i32).abs()
 }
 
 fn attacks_by(board: &Board, color: Color) -> BitBoard {
     let blockers = board.occupied();
     let mut attacks = BitBoard::EMPTY;
-    for pawn in board.colored_pieces(color, Piece::Pawn) {
-        attacks |= get_pawn_attacks(pawn, color);
+    for pawn in colored_pieces(board, color, Piece::Pawn) {
+        attacks |= attacks::pawn_attacks(color, pawn);
     }
-    for knight in board.colored_pieces(color, Piece::Knight) {
-        attacks |= get_knight_moves(knight);
+    for knight in colored_pieces(board, color, Piece::Knight) {
+        attacks |= attacks::knight_attacks(knight);
     }
-    for bishop in board.colored_pieces(color, Piece::Bishop) {
-        attacks |= get_bishop_moves(bishop, blockers);
+    for bishop in colored_pieces(board, color, Piece::Bishop) {
+        attacks |= attacks::bishop_attacks(bishop, blockers);
     }
-    for rook in board.colored_pieces(color, Piece::Rook) {
-        attacks |= get_rook_moves(rook, blockers);
+    for rook in colored_pieces(board, color, Piece::Rook) {
+        attacks |= attacks::rook_attacks(rook, blockers);
     }
-    for queen in board.colored_pieces(color, Piece::Queen) {
-        attacks |= get_rook_moves(queen, blockers) | get_bishop_moves(queen, blockers);
+    for queen in colored_pieces(board, color, Piece::Queen) {
+        attacks |= attacks::rook_attacks(queen, blockers) | attacks::bishop_attacks(queen, blockers);
     }
-    attacks | get_king_moves(board.king(color))
+    attacks | attacks::king_attacks(king_square(board, color))
 }
 
 fn has_friendly_pawn_on_adjacent_file(board: &Board, color: Color, file: i32) -> bool {
-    let pawns = board.colored_pieces(color, Piece::Pawn);
+    let pawns = colored_pieces(board, color, Piece::Pawn);
     for adjacent in [file - 1, file + 1] {
         if (0..8).contains(&adjacent) {
-            let file = File::try_index(adjacent as usize).expect("valid file");
-            if !(pawns & file.bitboard()).is_empty() {
+            let file = File::new(adjacent as u32);
+            if !(pawns & BitBoard::from_file(file)).is_empty() {
                 return true;
             }
         }
@@ -312,14 +316,14 @@ fn has_friendly_pawn_on_adjacent_file(board: &Board, color: Color, file: i32) ->
 }
 
 fn is_passed_pawn(color: Color, pawn: Square, enemy_pawns: BitBoard) -> bool {
-    let file = pawn.file() as i32;
-    let rank = pawn.rank() as i32;
+    let file = pawn.file().to_u32() as i32;
+    let rank = pawn.rank().to_u32() as i32;
     for enemy in enemy_pawns {
-        let enemy_file = enemy.file() as i32;
+        let enemy_file = enemy.file().to_u32() as i32;
         if (enemy_file - file).abs() > 1 {
             continue;
         }
-        let enemy_rank = enemy.rank() as i32;
+        let enemy_rank = enemy.rank().to_u32() as i32;
         match color {
             Color::White if enemy_rank > rank => return false,
             Color::Black if enemy_rank < rank => return false,
@@ -330,7 +334,7 @@ fn is_passed_pawn(color: Color, pawn: Square, enemy_pawns: BitBoard) -> bool {
 }
 
 fn relative_rank(color: Color, square: Square) -> i32 {
-    let rank = square.rank() as i32;
+    let rank = square.rank().to_u32() as i32;
     match color {
         Color::White => rank,
         Color::Black => 7 - rank,
@@ -360,3 +364,5 @@ mod tests {
         assert!(evaluate(&edge) > evaluate(&center));
     }
 }
+
+

@@ -1,10 +1,10 @@
-use cozy_chess::{
-    BitBoard, Board, Color, Move, Piece, Rank, Square, get_bishop_moves, get_king_moves,
-    get_knight_moves, get_pawn_attacks, get_rook_moves,
-};
+use shakmaty::{attacks, Bitboard as BitBoard, Board, Color, Move, Rank, Role as Piece, Square};
 
 use crate::eval::piece_value;
 use crate::position::Position;
+
+const COLOR_COUNT: usize = 2;
+const PIECE_COUNT: usize = 6;
 
 pub fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
     if !position.is_tactical(mv) {
@@ -12,8 +12,8 @@ pub fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
     }
 
     let board = position.board();
-    let side = board.side_to_move();
-    let Some(moved) = board.piece_on(mv.from) else {
+    let side = position.side_to_move();
+    let Some(moved) = board.role_at(move_from(mv)) else {
         return 0;
     };
 
@@ -21,7 +21,7 @@ pub fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
         .captured_piece(mv)
         .map(piece_value)
         .unwrap_or_default();
-    let promoted = mv.promotion.unwrap_or(moved);
+    let promoted = mv.promotion().unwrap_or(moved);
     let promotion_gain = promotion_gain(moved, promoted);
     let initial_gain = captured + promotion_gain;
     let Some((pieces, occupied)) = position_after_initial_capture(position, mv, moved, promoted)
@@ -29,7 +29,7 @@ pub fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
         return initial_gain;
     };
 
-    initial_gain - exchange_reply(!side, mv.to, pieces, occupied, piece_value(promoted))
+    initial_gain - exchange_reply(!side, mv.to(), pieces, occupied, piece_value(promoted))
 }
 
 fn position_after_initial_capture(
@@ -37,24 +37,24 @@ fn position_after_initial_capture(
     mv: Move,
     moved: Piece,
     promoted: Piece,
-) -> Option<([[BitBoard; Piece::NUM]; Color::NUM], BitBoard)> {
+) -> Option<([[BitBoard; PIECE_COUNT]; COLOR_COUNT], BitBoard)> {
     let board = position.board();
-    let side = board.side_to_move();
+    let side = position.side_to_move();
     let them = !side;
-    let target = mv.to.bitboard();
-    let from = mv.from.bitboard();
+    let target = BitBoard::from_square(mv.to());
+    let from = BitBoard::from_square(move_from(mv));
     let captured_square = captured_square(position, mv);
     let captured_piece = position.captured_piece(mv);
 
     let mut pieces = board_pieces(board);
     let mut occupied = board.occupied();
-    pieces[color_index(side)][piece_index(moved)] -= from;
-    occupied -= from;
+    pieces[color_index(side)][piece_index(moved)] &= !from;
+    occupied &= !from;
 
     if let (Some(square), Some(piece)) = (captured_square, captured_piece) {
-        let captured = square.bitboard();
-        pieces[color_index(them)][piece_index(piece)] -= captured;
-        occupied -= captured;
+        let captured = BitBoard::from_square(square);
+        pieces[color_index(them)][piece_index(piece)] &= !captured;
+        occupied &= !captured;
     }
 
     pieces[color_index(side)][piece_index(promoted)] |= target;
@@ -65,7 +65,7 @@ fn position_after_initial_capture(
 fn exchange_reply(
     side: Color,
     target: Square,
-    pieces: [[BitBoard; Piece::NUM]; Color::NUM],
+    pieces: [[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     occupied: BitBoard,
     target_value: i32,
 ) -> i32 {
@@ -96,7 +96,7 @@ struct Attacker {
 fn least_valuable_legal_attacker(
     side: Color,
     target: Square,
-    pieces: [[BitBoard; Piece::NUM]; Color::NUM],
+    pieces: [[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     occupied: BitBoard,
 ) -> Option<Attacker> {
     for piece in [
@@ -122,22 +122,22 @@ fn attackers_for_piece(
     side: Color,
     piece: Piece,
     target: Square,
-    pieces: [[BitBoard; Piece::NUM]; Color::NUM],
+    pieces: [[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     occupied: BitBoard,
 ) -> BitBoard {
     let side_pieces = pieces[color_index(side)];
     match piece {
-        Piece::Pawn => get_pawn_attacks(target, !side) & side_pieces[piece_index(Piece::Pawn)],
-        Piece::Knight => get_knight_moves(target) & side_pieces[piece_index(Piece::Knight)],
+        Piece::Pawn => attacks::pawn_attacks(!side, target) & side_pieces[piece_index(Piece::Pawn)],
+        Piece::Knight => attacks::knight_attacks(target) & side_pieces[piece_index(Piece::Knight)],
         Piece::Bishop => {
-            get_bishop_moves(target, occupied) & side_pieces[piece_index(Piece::Bishop)]
+            attacks::bishop_attacks(target, occupied) & side_pieces[piece_index(Piece::Bishop)]
         }
-        Piece::Rook => get_rook_moves(target, occupied) & side_pieces[piece_index(Piece::Rook)],
+        Piece::Rook => attacks::rook_attacks(target, occupied) & side_pieces[piece_index(Piece::Rook)],
         Piece::Queen => {
-            (get_bishop_moves(target, occupied) | get_rook_moves(target, occupied))
+            (attacks::bishop_attacks(target, occupied) | attacks::rook_attacks(target, occupied))
                 & side_pieces[piece_index(Piece::Queen)]
         }
-        Piece::King => get_king_moves(target) & side_pieces[piece_index(Piece::King)],
+        Piece::King => attacks::king_attacks(target) & side_pieces[piece_index(Piece::King)],
     }
 }
 
@@ -145,13 +145,13 @@ fn exchange_move_is_legal(
     side: Color,
     target: Square,
     attacker: Attacker,
-    pieces: [[BitBoard; Piece::NUM]; Color::NUM],
+    pieces: [[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     occupied: BitBoard,
 ) -> bool {
     let (next_pieces, next_occupied, _) =
         make_exchange_move(side, target, attacker, pieces, occupied);
     let king = next_pieces[color_index(side)][piece_index(Piece::King)]
-        .next_square()
+        .first()
         .unwrap_or(target);
     !square_attacked_by(&next_pieces, next_occupied, king, !side, true)
 }
@@ -160,19 +160,19 @@ fn make_exchange_move(
     side: Color,
     target: Square,
     attacker: Attacker,
-    mut pieces: [[BitBoard; Piece::NUM]; Color::NUM],
+    mut pieces: [[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     mut occupied: BitBoard,
-) -> ([[BitBoard; Piece::NUM]; Color::NUM], BitBoard, Piece) {
+) -> ([[BitBoard; PIECE_COUNT]; COLOR_COUNT], BitBoard, Piece) {
     let us = color_index(side);
     let them = color_index(!side);
-    let from = attacker.from.bitboard();
-    let target_bb = target.bitboard();
+    let from = BitBoard::from_square(attacker.from);
+    let target_bb = BitBoard::from_square(target);
     let promoted = promotion_piece(attacker.piece, side, target).unwrap_or(attacker.piece);
 
-    pieces[us][piece_index(attacker.piece)] -= from;
-    occupied -= from;
+    pieces[us][piece_index(attacker.piece)] &= !from;
+    occupied &= !from;
     for piece in Piece::ALL {
-        pieces[them][piece_index(piece)] -= target_bb;
+        pieces[them][piece_index(piece)] &= !target_bb;
     }
     pieces[us][piece_index(promoted)] |= target_bb;
     occupied |= target_bb;
@@ -181,30 +181,31 @@ fn make_exchange_move(
 }
 
 fn square_attacked_by(
-    pieces: &[[BitBoard; Piece::NUM]; Color::NUM],
+    pieces: &[[BitBoard; PIECE_COUNT]; COLOR_COUNT],
     occupied: BitBoard,
     square: Square,
     side: Color,
     include_king: bool,
 ) -> bool {
     let side_pieces = pieces[color_index(side)];
-    !(get_pawn_attacks(square, !side) & side_pieces[piece_index(Piece::Pawn)]).is_empty()
-        || !(get_knight_moves(square) & side_pieces[piece_index(Piece::Knight)]).is_empty()
-        || !(get_bishop_moves(square, occupied)
+    !(attacks::pawn_attacks(!side, square) & side_pieces[piece_index(Piece::Pawn)]).is_empty()
+        || !(attacks::knight_attacks(square) & side_pieces[piece_index(Piece::Knight)]).is_empty()
+        || !(attacks::bishop_attacks(square, occupied)
             & (side_pieces[piece_index(Piece::Bishop)] | side_pieces[piece_index(Piece::Queen)]))
         .is_empty()
-        || !(get_rook_moves(square, occupied)
+        || !(attacks::rook_attacks(square, occupied)
             & (side_pieces[piece_index(Piece::Rook)] | side_pieces[piece_index(Piece::Queen)]))
         .is_empty()
         || (include_king
-            && !(get_king_moves(square) & side_pieces[piece_index(Piece::King)]).is_empty())
+            && !(attacks::king_attacks(square) & side_pieces[piece_index(Piece::King)]).is_empty())
 }
 
-fn board_pieces(board: &Board) -> [[BitBoard; Piece::NUM]; Color::NUM] {
-    let mut pieces = [[BitBoard::EMPTY; Piece::NUM]; Color::NUM];
+fn board_pieces(board: &Board) -> [[BitBoard; PIECE_COUNT]; COLOR_COUNT] {
+    let mut pieces = [[BitBoard::EMPTY; PIECE_COUNT]; COLOR_COUNT];
     for color in Color::ALL {
         for piece in Piece::ALL {
-            pieces[color_index(color)][piece_index(piece)] = board.colored_pieces(color, piece);
+            pieces[color_index(color)][piece_index(piece)] =
+                board.by_color(color) & board.by_role(piece);
         }
     }
     pieces
@@ -214,15 +215,15 @@ fn captured_square(position: &Position, mv: Move) -> Option<Square> {
     if !position.is_capture(mv) {
         return None;
     }
-    if position.board().piece_on(mv.to).is_some() {
-        Some(mv.to)
+    if position.board().role_at(mv.to()).is_some() {
+        Some(mv.to())
     } else {
-        Some(Square::new(mv.to.file(), mv.from.rank()))
+        Some(Square::from_coords(mv.to().file(), move_from(mv).rank()))
     }
 }
 
 fn promotion_piece(piece: Piece, side: Color, target: Square) -> Option<Piece> {
-    (piece == Piece::Pawn && target.rank() == Rank::Eighth.relative_to(side))
+    (piece == Piece::Pawn && target.rank() == side.relative_rank(Rank::Eighth))
         .then_some(Piece::Queen)
 }
 
@@ -234,12 +235,19 @@ fn promotion_gain(from: Piece, to: Piece) -> i32 {
     }
 }
 
+fn move_from(mv: Move) -> Square {
+    mv.from().expect("standard chess move has an origin square")
+}
+
 fn piece_index(piece: Piece) -> usize {
-    piece as usize
+    usize::from(piece) - 1
 }
 
 fn color_index(color: Color) -> usize {
-    color as usize
+    match color {
+        Color::White => 0,
+        Color::Black => 1,
+    }
 }
 
 #[cfg(test)]
@@ -314,3 +322,5 @@ mod tests {
         assert!(static_exchange_eval(&position, mv) < -500);
     }
 }
+
+

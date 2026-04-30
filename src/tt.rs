@@ -1,6 +1,9 @@
-use cozy_chess::Move;
+use shakmaty::Move;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 const CLUSTER_SIZE: usize = 4;
+const HASHFULL_SAMPLE_CLUSTERS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bound {
@@ -29,47 +32,53 @@ struct Cluster {
     entries: [Option<StoredEntry>; CLUSTER_SIZE],
 }
 
-#[derive(Debug, Clone)]
 pub struct TranspositionTable {
-    clusters: Vec<Cluster>,
-    used: usize,
-    generation: u8,
+    clusters: Arc<Vec<Mutex<Cluster>>>,
+    used: Arc<AtomicUsize>,
+    generation: Arc<AtomicU8>,
 }
 
 impl TranspositionTable {
     pub fn new(hash_mb: usize) -> Self {
         let bytes = hash_mb.max(1).saturating_mul(1024 * 1024);
-        let cluster_size = std::mem::size_of::<Cluster>().max(1);
+        let cluster_size = std::mem::size_of::<Mutex<Cluster>>().max(1);
         let len = (bytes / cluster_size).max(256);
         Self {
-            clusters: vec![Cluster::default(); len],
-            used: 0,
-            generation: 0,
+            clusters: Arc::new((0..len).map(|_| Mutex::new(Cluster::default())).collect()),
+            used: Arc::new(AtomicUsize::new(0)),
+            generation: Arc::new(AtomicU8::new(0)),
         }
     }
 
-    pub fn new_search(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    pub fn new_search(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn clear(&mut self) {
-        self.clusters.fill(Cluster::default());
-        self.used = 0;
-        self.generation = 0;
+    pub fn clear(&self) {
+        for cluster in self.clusters.iter() {
+            *cluster.lock().expect("tt cluster lock poisoned") = Cluster::default();
+        }
+        self.used.store(0, Ordering::Relaxed);
+        self.generation.store(0, Ordering::Relaxed);
     }
 
     pub fn probe(&self, key: u64) -> Option<Entry> {
-        self.clusters[self.index(key)]
+        let cluster = self.clusters[self.index(key)]
+            .lock()
+            .expect("tt cluster lock poisoned");
+        cluster
             .entries
             .iter()
             .flatten()
             .find_map(|stored| (stored.entry.key == key).then_some(stored.entry))
     }
 
-    pub fn store(&mut self, entry: Entry) {
+    pub fn store(&self, entry: Entry) {
         let index = self.index(entry.key);
-        let generation = self.generation;
-        let cluster = &mut self.clusters[index];
+        let generation = self.generation.load(Ordering::Relaxed);
+        let mut cluster = self.clusters[index]
+            .lock()
+            .expect("tt cluster lock poisoned");
 
         if let Some(slot) = cluster
             .entries
@@ -88,7 +97,7 @@ impl TranspositionTable {
 
         if let Some(slot) = cluster.entries.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(StoredEntry { entry, generation });
-            self.used += 1;
+            self.used.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -104,15 +113,43 @@ impl TranspositionTable {
     }
 
     pub fn hashfull(&self) -> u64 {
-        if self.clusters.is_empty() {
+        let sample_clusters = self.clusters.len().min(HASHFULL_SAMPLE_CLUSTERS);
+        if sample_clusters == 0 {
             return 0;
         }
-        let total_slots = self.clusters.len() * CLUSTER_SIZE;
-        ((self.used.min(total_slots) as u64) * 1000) / total_slots as u64
+
+        let generation = self.generation.load(Ordering::Relaxed);
+        let current_generation_entries = self
+            .clusters
+            .iter()
+            .take(sample_clusters)
+            .map(|cluster| {
+                cluster
+                    .lock()
+                    .expect("tt cluster lock poisoned")
+                    .entries
+                    .iter()
+                    .flatten()
+                    .filter(|stored| stored.generation == generation)
+                    .count()
+            })
+            .sum::<usize>();
+        let sampled_slots = sample_clusters * CLUSTER_SIZE;
+        (current_generation_entries as u64 * 1000) / sampled_slots as u64
     }
 
     fn index(&self, key: u64) -> usize {
         key as usize % self.clusters.len()
+    }
+}
+
+impl Clone for TranspositionTable {
+    fn clone(&self) -> Self {
+        Self {
+            clusters: Arc::clone(&self.clusters),
+            used: Arc::clone(&self.used),
+            generation: Arc::clone(&self.generation),
+        }
     }
 }
 
@@ -125,7 +162,7 @@ fn replacement_priority(entry: StoredEntry, generation: u8) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cozy_chess::{Move, Square};
+    use shakmaty::{Move, Role, Square};
 
     fn entry(key: u64, depth: i16, bound: Bound) -> Entry {
         Entry {
@@ -133,8 +170,10 @@ mod tests {
             depth,
             score: i32::from(depth),
             bound,
-            best_move: Some(Move {
+            best_move: Some(Move::Normal {
+                role: Role::King,
                 from: Square::A1,
+                capture: None,
                 to: Square::A2,
                 promotion: None,
             }),
@@ -143,7 +182,7 @@ mod tests {
 
     #[test]
     fn cluster_probe_finds_colliding_entries() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let stride = tt.clusters.len() as u64;
         for i in 0..CLUSTER_SIZE {
             tt.store(entry(1 + stride * i as u64, i as i16 + 1, Bound::Lower));
@@ -153,12 +192,12 @@ mod tests {
             let key = 1 + stride * i as u64;
             assert_eq!(tt.probe(key).map(|entry| entry.depth), Some(i as i16 + 1));
         }
-        assert_eq!(tt.used, CLUSTER_SIZE);
+        assert_eq!(tt.used.load(Ordering::Relaxed), CLUSTER_SIZE);
     }
 
     #[test]
     fn replacement_prefers_stale_shallow_non_exact_entries() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let stride = tt.clusters.len() as u64;
         tt.store(entry(2, 8, Bound::Exact));
         tt.store(entry(2 + stride, 2, Bound::Upper));
@@ -171,5 +210,28 @@ mod tests {
         assert!(tt.probe(2).is_some());
         assert!(tt.probe(2 + stride).is_none());
         assert!(tt.probe(2 + stride * 4).is_some());
+    }
+
+    #[test]
+    fn hashfull_counts_only_current_generation_entries() {
+        let tt = TranspositionTable::new(1);
+        let stride = tt.clusters.len() as u64;
+        for i in 0..CLUSTER_SIZE {
+            tt.store(entry(stride * i as u64, i as i16 + 1, Bound::Lower));
+        }
+
+        assert!(tt.hashfull() > 0);
+        assert_eq!(tt.used.load(Ordering::Relaxed), CLUSTER_SIZE);
+
+        tt.new_search();
+
+        assert_eq!(tt.hashfull(), 0);
+        assert_eq!(tt.used.load(Ordering::Relaxed), CLUSTER_SIZE);
+
+        for i in 0..CLUSTER_SIZE {
+            tt.store(entry(stride * (CLUSTER_SIZE + i) as u64, 8, Bound::Exact));
+        }
+
+        assert!(tt.hashfull() > 0);
     }
 }

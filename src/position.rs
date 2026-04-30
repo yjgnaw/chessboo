@@ -1,10 +1,16 @@
 use std::fmt;
 
-use cozy_chess::{Board, Color, File, GameStatus, Move, Piece, Rank, Square};
+use shakmaty::fen::Fen;
+use shakmaty::uci::UciMove;
+use shakmaty::zobrist::Zobrist64;
+use shakmaty::{
+    Bitboard, Board, CastlingMode, Chess, Color, EnPassantMode, KnownOutcome, Move, Outcome,
+    Position as ShakmatyPosition, Role, Square,
+};
 
 #[derive(Debug, Clone)]
 pub struct Position {
-    board: Board,
+    board: Chess,
     history: Vec<u64>,
 }
 
@@ -24,17 +30,22 @@ impl Position {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
     pub fn startpos() -> Self {
-        Self::from_board(Board::startpos())
+        Self::from_chess(Chess::new())
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, PositionError> {
-        let board = fen
-            .parse::<Board>()
+        let parsed = fen
+            .parse::<Fen>()
             .map_err(|err| PositionError(format!("invalid FEN `{fen}`: {err}")))?;
-        Ok(Self::from_board(board))
+        let board = parsed
+            .into_position(CastlingMode::Standard)
+            .or_else(|err| err.ignore_invalid_ep_square())
+            .or_else(|err| err.ignore_invalid_castling_rights())
+            .map_err(|err| PositionError(format!("invalid FEN `{fen}`: {err}")))?;
+        Ok(Self::from_chess(board))
     }
 
-    pub fn from_board(board: Board) -> Self {
+    pub fn from_chess(board: Chess) -> Self {
         let mut position = Self {
             board,
             history: Vec::with_capacity(128),
@@ -44,19 +55,24 @@ impl Position {
     }
 
     pub fn board(&self) -> &Board {
-        &self.board
+        self.board.board()
+    }
+
+    pub fn to_shakmaty(&self) -> Chess {
+        self.board.clone()
     }
 
     pub fn side_to_move(&self) -> Color {
-        self.board.side_to_move()
+        self.board.turn()
     }
 
     pub fn hash(&self) -> u64 {
-        self.board.hash()
+        let Zobrist64(hash) = self.board.zobrist_hash(EnPassantMode::Legal);
+        hash
     }
 
     pub fn repetition_hash(&self) -> u64 {
-        self.board.hash_without_ep()
+        self.hash()
     }
 
     pub fn history(&self) -> &[u64] {
@@ -64,16 +80,39 @@ impl Position {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
-        let mut moves = Vec::with_capacity(64);
-        self.board.generate_moves(|piece_moves| {
-            moves.extend(piece_moves);
-            false
-        });
-        moves
+        self.board.legal_moves().into_iter().collect()
+    }
+
+    pub fn is_legal(&self, mv: Move) -> bool {
+        self.board.is_legal(mv)
+    }
+
+    pub fn checkers(&self) -> Bitboard {
+        self.board.checkers()
+    }
+
+    pub fn piece_on(&self, square: Square) -> Option<Role> {
+        self.board().role_at(square)
+    }
+
+    pub fn color_on(&self, square: Square) -> Option<Color> {
+        self.board().color_at(square)
+    }
+
+    pub fn piece_count(&self) -> usize {
+        self.board().occupied().count()
+    }
+
+    pub fn has_castling_rights(&self) -> bool {
+        self.board.castles().castling_rights().any()
+    }
+
+    pub fn halfmove_clock(&self) -> u8 {
+        self.board.halfmoves().min(u32::from(u8::MAX)) as u8
     }
 
     pub fn play(&mut self, mv: Move) -> Result<(), PositionError> {
-        if !self.board.is_legal(mv) {
+        if !self.is_legal(mv) {
             return Err(PositionError(format!("illegal move {}", self.to_uci(mv))));
         }
         self.board.play_unchecked(mv);
@@ -89,7 +128,7 @@ impl Position {
     }
 
     pub fn null_move(&self) -> Option<Self> {
-        let board = self.board.null_move()?;
+        let board = self.board.clone().swap_turn().ok()?;
         Some(Self {
             board,
             history: self.history.clone(),
@@ -103,90 +142,61 @@ impl Position {
     }
 
     pub fn uci_to_move(&self, text: &str) -> Result<Move, PositionError> {
-        let normalized = text.trim().to_ascii_lowercase();
-        if normalized.len() < 4 {
-            return Err(PositionError(format!("invalid UCI move `{text}`")));
-        }
-
-        let direct = normalized
-            .parse::<Move>()
-            .map_err(|_| PositionError(format!("invalid UCI move `{text}`")))?;
-        if self.board.is_legal(direct) {
-            return Ok(direct);
-        }
-
-        if let Some(castle) = self.uci_castle_to_internal(&normalized)
-            && self.board.is_legal(castle)
-        {
-            return Ok(castle);
-        }
-
-        Err(PositionError(format!("illegal UCI move `{text}`")))
+        let uci = text
+            .trim()
+            .parse::<UciMove>()
+            .map_err(|err| PositionError(format!("invalid UCI move `{text}`: {err}")))?;
+        uci.to_move(&self.board)
+            .map_err(|err| PositionError(format!("illegal UCI move `{text}`: {err}")))
     }
 
     pub fn to_uci(&self, mv: Move) -> String {
-        if self.is_internal_castle(mv) {
-            let rank = mv.from.rank();
-            let target_file = if mv.to.file() > mv.from.file() {
-                File::G
-            } else {
-                File::C
-            };
-            let target = Square::new(target_file, rank);
-            format!("{}{}{}", mv.from, target, promotion_suffix(mv.promotion))
-        } else {
-            format!("{}{}{}", mv.from, mv.to, promotion_suffix(mv.promotion))
-        }
+        UciMove::from_move(mv, self.board.castles().mode()).to_string()
     }
 
     pub fn is_draw(&self) -> bool {
-        self.board.status() == GameStatus::Drawn
+        self.known_outcome() == Some(KnownOutcome::Draw)
             || self.is_threefold_repetition()
             || self.has_insufficient_material()
     }
 
     pub fn is_terminal(&self) -> bool {
-        self.board.status() != GameStatus::Ongoing || self.is_draw()
+        self.known_outcome().is_some() || self.is_draw()
+    }
+
+    pub fn known_outcome(&self) -> Option<KnownOutcome> {
+        self.board.outcome().known()
     }
 
     pub fn result_string(&self) -> &'static str {
         if self.is_draw() {
             "1/2-1/2"
-        } else if self.board.status() == GameStatus::Won {
-            match self.board.side_to_move() {
-                Color::White => "0-1",
-                Color::Black => "1-0",
-            }
         } else {
-            "*"
+            match self.known_outcome() {
+                Some(outcome) => outcome.as_str(),
+                None => "*",
+            }
         }
     }
 
     pub fn is_capture(&self, mv: Move) -> bool {
-        if self.board.color_on(mv.to) == Some(!self.board.side_to_move()) {
-            return true;
-        }
-        self.is_en_passant_capture(mv)
+        mv.is_capture()
     }
 
     pub fn is_tactical(&self, mv: Move) -> bool {
-        self.is_capture(mv) || mv.promotion.is_some()
+        self.is_capture(mv) || mv.promotion().is_some()
     }
 
-    pub fn moved_piece(&self, mv: Move) -> Option<Piece> {
-        self.board.piece_on(mv.from)
+    pub fn moved_piece(&self, mv: Move) -> Option<Role> {
+        Some(mv.role())
     }
 
-    pub fn captured_piece(&self, mv: Move) -> Option<Piece> {
-        if self.is_en_passant_capture(mv) {
-            Some(Piece::Pawn)
-        } else {
-            self.board.piece_on(mv.to)
-        }
+    pub fn captured_piece(&self, mv: Move) -> Option<Role> {
+        mv.capture()
     }
 
     pub fn is_quiet(&self, mv: Move) -> bool {
-        !self.is_capture(mv) && mv.promotion.is_none()
+        !self.is_capture(mv) && mv.promotion().is_none()
     }
 
     fn push_history(&mut self) {
@@ -204,104 +214,14 @@ impl Position {
     }
 
     fn has_insufficient_material(&self) -> bool {
-        if !(self.board.pieces(Piece::Pawn)
-            | self.board.pieces(Piece::Rook)
-            | self.board.pieces(Piece::Queen))
-        .is_empty()
-        {
-            return false;
-        }
-
-        let white_minors = (self.board.colored_pieces(Color::White, Piece::Knight)
-            | self.board.colored_pieces(Color::White, Piece::Bishop))
-        .len();
-        let black_minors = (self.board.colored_pieces(Color::Black, Piece::Knight)
-            | self.board.colored_pieces(Color::Black, Piece::Bishop))
-        .len();
-        let total_minors = white_minors + black_minors;
-
-        if total_minors <= 1 {
-            return true;
-        }
-
-        if total_minors == 2
-            && white_minors == 1
-            && black_minors == 1
-            && self.board.pieces(Piece::Knight).is_empty()
-        {
-            let white_bishop = self
-                .board
-                .colored_pieces(Color::White, Piece::Bishop)
-                .next_square();
-            let black_bishop = self
-                .board
-                .colored_pieces(Color::Black, Piece::Bishop)
-                .next_square();
-            if let (Some(wb), Some(bb)) = (white_bishop, black_bishop) {
-                return square_color(wb) == square_color(bb);
-            }
-        }
-
-        false
-    }
-
-    fn is_en_passant_capture(&self, mv: Move) -> bool {
-        if self.board.piece_on(mv.from) != Some(Piece::Pawn) || self.board.piece_on(mv.to).is_some()
-        {
-            return false;
-        }
-        let Some(ep_file) = self.board.en_passant() else {
-            return false;
-        };
-        mv.to.file() == ep_file && mv.from.file() != mv.to.file()
-    }
-
-    fn is_internal_castle(&self, mv: Move) -> bool {
-        self.board.piece_on(mv.from) == Some(Piece::King)
-            && self.board.color_on(mv.to) == Some(self.board.side_to_move())
-    }
-
-    fn uci_castle_to_internal(&self, text: &str) -> Option<Move> {
-        let from = parse_square(text.get(0..2)?)?;
-        let to = parse_square(text.get(2..4)?)?;
-        if self.board.piece_on(from) != Some(Piece::King) {
-            return None;
-        }
-        let rank = Rank::First.relative_to(self.board.side_to_move());
-        if from.rank() != rank || to.rank() != rank {
-            return None;
-        }
-
-        let rights = self.board.castle_rights(self.board.side_to_move());
-        let rook_file = match to.file() {
-            File::G => rights.short?,
-            File::C => rights.long?,
-            _ => return None,
-        };
-        Some(Move {
-            from,
-            to: Square::new(rook_file, rank),
-            promotion: None,
-        })
+        matches!(self.board.outcome(), Outcome::Known(KnownOutcome::Draw))
+            || self.board.is_insufficient_material()
     }
 }
 
-fn parse_square(text: &str) -> Option<Square> {
-    text.parse::<Square>().ok()
-}
-
-fn promotion_suffix(piece: Option<Piece>) -> &'static str {
-    match piece {
-        Some(Piece::Knight) => "n",
-        Some(Piece::Bishop) => "b",
-        Some(Piece::Rook) => "r",
-        Some(Piece::Queen) => "q",
-        _ => "",
-    }
-}
-
+#[cfg(test)]
 fn square_color(square: Square) -> bool {
-    (square.file() as u8 + square.rank() as u8).is_multiple_of(2)
+    (square.file().to_u32() + square.rank().to_u32()).is_multiple_of(2)
 }
 
 #[cfg(test)]
@@ -317,7 +237,7 @@ mod tests {
     fn translates_standard_uci_castling() {
         let position = Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
         let mv = position.uci_to_move("e1g1").unwrap();
-        assert_eq!(format!("{mv}"), "e1h1");
+        assert!(mv.is_castle());
         assert_eq!(position.to_uci(mv), "e1g1");
     }
 
@@ -325,5 +245,18 @@ mod tests {
     fn rejects_illegal_uci_move() {
         let position = Position::startpos();
         assert!(position.uci_to_move("e1e8").is_err());
+    }
+
+    #[test]
+    fn bishops_on_same_color_are_insufficient_material() {
+        let position = Position::from_fen("4k3/8/1b6/8/8/8/8/2B1K3 w - - 0 1").unwrap();
+        let white_bishop = (position.board().by_color(Color::White) & position.board().by_role(Role::Bishop))
+            .first()
+            .unwrap();
+        let black_bishop = (position.board().by_color(Color::Black) & position.board().by_role(Role::Bishop))
+            .first()
+            .unwrap();
+        assert_eq!(square_color(white_bishop), square_color(black_bishop));
+        assert!(position.is_draw());
     }
 }

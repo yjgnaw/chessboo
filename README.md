@@ -1,49 +1,57 @@
-# Chessboo
+<div align="center">
 
-Current version: `0.5.0`.
+  <img src="logo.png" alt="Chessboo logo" width="128" height="128" />
 
-Chessboo is an original Rust UCI chess engine. It uses `cozy-chess` for legal move generation and implements its own position wrapper, classical evaluation, alpha-beta search, transposition table, time management, UCI loop, and developer commands.
+  <h3>Chessboo</h3>
 
-## Build
+  A~~n original~~ UCI-compliant chess engine written in Rust.
+</div>
 
-```powershell
+It features a custom alpha-beta search, time management, Syzygy tablebase probing, and supports classical evaluation as well as NNUE.
+
+## Features
+
+- **Search**: Iterative deepening, fail-soft negamax, Alpha-Beta, Principal Variation Search (PVS), Quiescence Search, and Lazy-SMP multi-threading.
+- **Heuristics**: Null Move Pruning, Reverse Futility Pruning, ProbCut, Late Move Reductions (LMR), Late Move Pruning, SEE-based capture ordering, and History Heuristics.
+- **Evaluation**:
+  - NNUE evaluation (`(768 -> 128)x2 -> 1` architecture).
+  - Tapered classical evaluation (material, piece-square tables, mobility, pawn structure, king safety).
+- **Tablebases**: Full Syzygy WDL/DTZ tablebase probing support.
+- **UCI Protocol**: Fully compliant, supporting GUI integration, multi-threading, pondering, and rich configuration options.
+
+## Building from Source
+
+Since pre-compiled platform binaries are not included in the repository, you will need to compile the engine from source using [Rust](https://www.rust-lang.org/tools/install) and `cargo`.
+
+```shell
+git clone https://www.github.com/yjgnaw/chessboo.git
+cd chessboo
+
+# Build the release binary
 cargo build --release
 ```
 
-The engine binary is:
+The compiled binary will be located at `target/release/chessboo` (or `target\release\chessboo.exe` on Windows).
 
-```powershell
-target\release\chessboo.exe
-```
+## Usage
 
-## Commands
+Chessboo is an engine, not a graphical chess program. To play against it or use it for analysis, you should install a UCI-compatible Graphical User Interface (GUI) such as:
 
-```powershell
-target\release\chessboo.exe uci
-target\release\chessboo.exe perft --depth 4
-target\release\chessboo.exe perft --fen "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1" --depth 2
-target\release\chessboo.exe bench --depth 6
-target\release\chessboo.exe selfplay --games 1 --depth 2 --nodes 5000 --plies 40
-```
+- [Cutechess](https://cutechess.com/)
+- [Arena Chess GUI](http://www.playwitharena.de/)
+- [BanksiaGUI](https://banksiagui.com/)
+- [En Croissant](https://encroissant.org/)
 
-## UCI Options
+Add the built `chessboo` binary to your chosen GUI as a UCI engine.
 
-- `Hash`: transposition table size in MB.
-- `Move Overhead`: milliseconds reserved to avoid time forfeits.
-- `Clear Hash`: clears the transposition table.
+### UCI Options
 
-## Current Engine Features
+You can configure Chessboo through the GUI or directly via UCI commands. Available options include:
 
-- UCI support for `uci`, `isready`, `ucinewgame`, `position`, `go`, `stop`, `quit`, and `setoption`.
-- UCI treats bare `go` as `go infinite`.
-- Search with iterative deepening, fail-soft negamax, alpha-beta, principal variation search, quiescence, transposition table, mate scores, null-move pruning, reverse futility pruning, ProbCut, late move pruning, history-sensitive late move reductions, extended futility pruning, SEE-based bad-capture pruning, killer/counter-move/history ordering with quiet-move maluses, and principal variation reporting.
-- Classical tapered evaluation with material, piece-square terms, mobility, pawn structure, passed pawns, bishop pair, rook files, king safety, endgame mop-up, and threats.
-- Legality-aware static exchange evaluation for capture ordering and quiescence pruning.
-- Time management with separate soft and hard search budgets for real clock controls, tuned to avoid front-loading the clock in increment games.
-- Perft, bench, and bounded self-play developer commands.
-
-## Next Strength Work
-
-- Tune evaluation weights with self-play or Texel-style data.
-- Add multi-threaded search after single-threaded strength stabilizes.
-- Add a reproducible NNUE pipeline later, likely with `bullet`.
+- `Hash`: Size of the transposition table in MB.
+- `Threads`: Number of search threads (Lazy SMP).
+- `SyzygyPath`: Path to your downloaded Syzygy WDL/DTZ files.
+- `SyzygyProbeDepth` / `SyzygyProbeLimit` / `Syzygy50MoveRule`: Advanced tablebase probing configuration.
+- `Use NNUE`: Toggle the NNUE evaluator.
+- `EvalFile`: Path to an external `.nnue` file.
+- `Move Overhead`: Configurable safety margin for time management in milliseconds.

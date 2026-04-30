@@ -2,11 +2,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cozy_chess::{Color, GameStatus, Move, Piece};
+use shakmaty::{Color, KnownOutcome, Move, Role as Piece, Square};
 
-use crate::eval::{evaluate, piece_value};
+use crate::eval::piece_value;
+use crate::nnue::{INTERNAL_EVAL_FILE, NnueNet, NnuePosition};
 use crate::position::Position;
 use crate::see::static_exchange_eval;
+use crate::syzygy::{
+    DEFAULT_SYZYGY_PATH, DEFAULT_SYZYGY_PROBE_DEPTH, DEFAULT_SYZYGY_PROBE_LIMIT, SyzygyTablebase,
+};
 use crate::time::TimeControl;
 use crate::tt::{Bound, Entry, TranspositionTable};
 
@@ -20,7 +24,8 @@ const COUNTER_MOVE_SCORE: i32 = 785_000;
 const QUIET_BASE_SCORE: i32 = 400_000;
 const BAD_CAPTURE_BASE_SCORE: i32 = 100_000;
 const MAX_HISTORY_SCORE: i32 = 32_000;
-const TIME_CHECK_NODE_MASK: u64 = 1023;
+const TIME_CHECK_INTERVAL_NODES: u32 = 512;
+const NODE_LIMIT_CHECK_DIVISOR: u64 = 1024;
 const REVERSE_FUTILITY_MAX_DEPTH: i32 = 3;
 const FUTILITY_MAX_DEPTH: i32 = 3;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i32 = 3;
@@ -29,6 +34,9 @@ const PROBCUT_REDUCTION: i32 = 3;
 const PROBCUT_MARGIN: i32 = 180;
 const PROBCUT_MAX_MOVES: usize = 8;
 const MAX_SOFT_EXTENSIONS: u32 = 2;
+const TB_WIN_SCORE: i32 = MATE_THRESHOLD - MAX_PLY as i32 - 1;
+const COLOR_COUNT: usize = 2;
+const PIECE_COUNT: usize = 6;
 
 pub type SearchReporter = Box<dyn Fn(SearchInfo) + Send + 'static>;
 
@@ -36,13 +44,33 @@ pub type SearchReporter = Box<dyn Fn(SearchInfo) + Send + 'static>;
 pub struct SearchOptions {
     pub hash_mb: usize,
     pub move_overhead: Duration,
+    pub threads: usize,
+    pub reset_tt: bool,
+    pub use_nnue: bool,
+    pub eval_file: Option<String>,
+    pub nnue: Option<Arc<NnueNet>>,
+    pub syzygy_path: String,
+    pub syzygy: Option<Arc<SyzygyTablebase>>,
+    pub syzygy_probe_depth: u32,
+    pub syzygy_50_move_rule: bool,
+    pub syzygy_probe_limit: usize,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             hash_mb: 32,
-            move_overhead: Duration::from_millis(25),
+            move_overhead: Duration::from_millis(10),
+            threads: 1,
+            reset_tt: true,
+            use_nnue: true,
+            eval_file: Some(INTERNAL_EVAL_FILE.to_string()),
+            nnue: NnueNet::embedded().ok(),
+            syzygy_path: DEFAULT_SYZYGY_PATH.to_string(),
+            syzygy: None,
+            syzygy_probe_depth: DEFAULT_SYZYGY_PROBE_DEPTH,
+            syzygy_50_move_rule: true,
+            syzygy_probe_limit: DEFAULT_SYZYGY_PROBE_LIMIT,
         }
     }
 }
@@ -53,6 +81,7 @@ pub struct SearchLimits {
     pub nodes: Option<u64>,
     pub movetime: Option<Duration>,
     pub infinite: bool,
+    pub ponder_hit: Option<Arc<AtomicBool>>,
     pub white_time: Option<Duration>,
     pub black_time: Option<Duration>,
     pub white_increment: Option<Duration>,
@@ -62,7 +91,7 @@ pub struct SearchLimits {
 }
 
 impl SearchLimits {
-    fn time_control(&self, move_overhead: Duration) -> TimeControl {
+    fn time_control(&self, move_overhead: Duration, ply: u32) -> TimeControl {
         TimeControl {
             depth: self.depth,
             nodes: self.nodes,
@@ -74,6 +103,7 @@ impl SearchLimits {
             black_increment: self.black_increment,
             moves_to_go: self.moves_to_go,
             move_overhead,
+            ply,
         }
     }
 }
@@ -87,6 +117,7 @@ pub struct SearchInfo {
     pub nps: u64,
     pub elapsed_ms: u128,
     pub hashfull: u64,
+    pub tbhits: u64,
     pub pv: Vec<String>,
 }
 
@@ -97,6 +128,7 @@ pub struct SearchOutcome {
     pub score: i32,
     pub depth: u32,
     pub nodes: u64,
+    pub tbhits: u64,
     pub elapsed: Duration,
     pub pv: Vec<Move>,
 }
@@ -130,7 +162,7 @@ impl NodeContext {
 }
 
 pub struct Searcher {
-    root: Position,
+    root: NnuePosition,
     options: SearchOptions,
     limits: SearchLimits,
     tt: TranspositionTable,
@@ -139,13 +171,17 @@ pub struct Searcher {
     start: Instant,
     soft_deadline: Option<Instant>,
     hard_deadline: Option<Instant>,
+    ponder_clock_started: bool,
+    time_check_countdown: u32,
+    time_check_interval: u32,
     nodes: u64,
+    tbhits: u64,
     seldepth: usize,
     aborted: bool,
     killers: [[Option<Move>; 2]; MAX_PLY],
     counter_moves: [[Option<Move>; 64]; 64],
-    quiet_history: [[[i32; 64]; Piece::NUM]; Color::NUM],
-    capture_history: [[[i32; 64]; Piece::NUM]; Piece::NUM],
+    quiet_history: [[[i32; 64]; PIECE_COUNT]; COLOR_COUNT],
+    capture_history: [[[i32; 64]; PIECE_COUNT]; PIECE_COUNT],
 }
 
 impl Searcher {
@@ -157,8 +193,13 @@ impl Searcher {
         stop: Arc<AtomicBool>,
         reporter: Option<SearchReporter>,
     ) -> Self {
+        let net = options
+            .use_nnue
+            .then(|| options.nnue.clone())
+            .flatten()
+            .filter(|net| !net.is_bootstrap());
         Self {
-            root,
+            root: NnuePosition::new(root, net),
             options,
             limits,
             tt,
@@ -167,47 +208,68 @@ impl Searcher {
             start: Instant::now(),
             soft_deadline: None,
             hard_deadline: None,
+            ponder_clock_started: false,
+            time_check_countdown: 0,
+            time_check_interval: TIME_CHECK_INTERVAL_NODES,
             nodes: 0,
+            tbhits: 0,
             seldepth: 0,
             aborted: false,
             killers: [[None; 2]; MAX_PLY],
             counter_moves: [[None; 64]; 64],
-            quiet_history: [[[0; 64]; Piece::NUM]; Color::NUM],
-            capture_history: [[[0; 64]; Piece::NUM]; Piece::NUM],
+            quiet_history: [[[0; 64]; PIECE_COUNT]; COLOR_COUNT],
+            capture_history: [[[0; 64]; PIECE_COUNT]; PIECE_COUNT],
         }
     }
 
     pub fn search(&mut self) -> SearchOutcome {
         self.start = Instant::now();
-        let deadlines = self
-            .limits
-            .time_control(self.options.move_overhead)
-            .deadlines(self.root.side_to_move(), self.start);
-        self.soft_deadline = deadlines.soft;
-        self.hard_deadline = deadlines.hard;
+        self.ponder_clock_started = self.limits.ponder_hit.is_none();
+        if self.ponder_clock_started {
+            let deadlines = self
+                .time_control()
+                .deadlines(self.root.side_to_move(), self.start);
+            self.soft_deadline = deadlines.soft;
+            self.hard_deadline = deadlines.hard;
+        } else {
+            self.soft_deadline = None;
+            self.hard_deadline = None;
+        }
         self.nodes = 0;
+        self.tbhits = 0;
+        self.time_check_countdown = 0;
+        self.time_check_interval = time_check_interval(&self.limits);
         self.seldepth = 0;
         self.aborted = false;
-        self.tt.new_search();
+        if self.options.reset_tt {
+            self.tt.new_search();
+        }
 
         let root_moves = self.root_moves();
         if root_moves.is_empty() {
             let score = terminal_score(&self.root, 0).unwrap_or(0);
             return SearchOutcome {
-                root: self.root.clone(),
+                root: self.root.position().clone(),
                 best_move: None,
                 score,
                 depth: 0,
                 nodes: self.nodes,
+                tbhits: self.tbhits,
                 elapsed: self.start.elapsed(),
                 pv: Vec::new(),
             };
         }
 
-        let max_depth = self
-            .limits
-            .time_control(self.options.move_overhead)
-            .max_depth();
+        if let Some(outcome) = self.syzygy_root_outcome(&root_moves) {
+            return outcome;
+        }
+
+        let time_control = self.time_control();
+        let max_depth = if self.limits.ponder_hit.is_some() && self.limits.depth.is_none() {
+            128
+        } else {
+            time_control.max_depth()
+        };
         let mut best_move = root_moves.first().copied();
         let mut best_score = -INF;
         let mut completed_depth = 0;
@@ -216,6 +278,7 @@ impl Searcher {
         let mut soft_extensions = 0_u32;
 
         for depth in 1..=max_depth {
+            self.maybe_start_ponder_clock();
             if completed_depth > 0
                 && self.soft_time_expired()
                 && !self.can_extend_after_soft(instability, soft_extensions)
@@ -255,7 +318,7 @@ impl Searcher {
 
             if self.aborted {
                 if completed_depth == 0 {
-                    best_score = evaluate(&self.root);
+                    best_score = self.root.evaluate();
                 }
                 break;
             }
@@ -275,9 +338,12 @@ impl Searcher {
             }
             completed_depth = depth;
             completed_pv = self.extract_pv(depth as usize);
+            if let Some(best) = best_move {
+                completed_pv = ensure_pv_starts_with(best, completed_pv);
+            }
             self.report(completed_depth, best_score, &completed_pv);
 
-            if best_score.abs() >= MATE_THRESHOLD {
+            if best_score.abs() >= MATE_THRESHOLD && !self.pondering_before_hit() {
                 break;
             }
             if self.soft_time_expired() {
@@ -290,11 +356,12 @@ impl Searcher {
         }
 
         SearchOutcome {
-            root: self.root.clone(),
+            root: self.root.position().clone(),
             best_move,
             score: best_score,
             depth: completed_depth,
             nodes: self.nodes,
+            tbhits: self.tbhits,
             elapsed: self.start.elapsed(),
             pv: completed_pv,
         }
@@ -307,7 +374,13 @@ impl Searcher {
     fn root_moves(&self) -> Vec<Move> {
         let mut moves = self.root.legal_moves();
         if !self.limits.search_moves.is_empty() {
-            moves.retain(|mv| self.limits.search_moves.contains(mv));
+            moves = self
+                .limits
+                .search_moves
+                .iter()
+                .copied()
+                .filter(|mv| moves.contains(mv))
+                .collect();
         }
         moves
     }
@@ -338,7 +411,7 @@ impl Searcher {
 
             let child = self.root.after_move(mv);
             let mut child_depth = depth - 1;
-            if !child.board().checkers().is_empty() {
+            if !child.checkers().is_empty() {
                 child_depth += 1;
             }
             let score = if searched == 0 {
@@ -409,7 +482,7 @@ impl Searcher {
 
     fn negamax(
         &mut self,
-        position: &Position,
+        position: &NnuePosition,
         mut depth: i32,
         mut alpha: i32,
         beta: i32,
@@ -417,13 +490,13 @@ impl Searcher {
         context: NodeContext,
     ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return evaluate(position);
+            return position.evaluate();
         }
         self.seldepth = self.seldepth.max(ply);
         self.nodes = self.nodes.saturating_add(1);
         if self.should_stop() {
             self.aborted = true;
-            return evaluate(position);
+            return position.evaluate();
         }
 
         if let Some(score) = terminal_score(position, ply) {
@@ -432,11 +505,14 @@ impl Searcher {
         if position.is_draw() {
             return 0;
         }
+        if let Some(score) = self.probe_syzygy_node(position, depth, ply) {
+            return score;
+        }
         if depth <= 0 {
             return self.quiescence(position, alpha, beta, ply);
         }
 
-        let in_check = !position.board().checkers().is_empty();
+        let in_check = !position.checkers().is_empty();
         if in_check && ply < MAX_CHECK_EXTENSION_PLY {
             depth += 1;
         }
@@ -457,7 +533,7 @@ impl Searcher {
             }
         }
 
-        let static_eval = evaluate(position);
+        let static_eval = position.evaluate();
         let near_mate_window = alpha.abs() >= MATE_THRESHOLD || beta.abs() >= MATE_THRESHOLD;
         if !in_check
             && !is_pv_node
@@ -551,7 +627,7 @@ impl Searcher {
                 && static_eval + futility_margin(depth) <= alpha
             {
                 let next = position.after_move(mv);
-                if next.board().checkers().is_empty() {
+                if next.checkers().is_empty() {
                     continue;
                 }
                 child = Some(next);
@@ -564,7 +640,7 @@ impl Searcher {
                 && !near_mate_window
             {
                 let next = child.get_or_insert_with(|| position.after_move(mv));
-                if next.board().checkers().is_empty() {
+                if next.checkers().is_empty() {
                     continue;
                 }
             }
@@ -572,17 +648,17 @@ impl Searcher {
                 && !is_pv_node
                 && depth <= 3
                 && position.is_capture(mv)
-                && mv.promotion.is_none()
+                && mv.promotion().is_none()
                 && searched > 0
                 && !near_mate_window
-                && static_exchange_eval(position, mv) < -120 * depth
+                && static_exchange_eval(position.position(), mv) < -120 * depth
             {
                 continue;
             }
 
             let child = child.unwrap_or_else(|| position.after_move(mv));
             let mut child_depth = depth - 1;
-            if !child.board().checkers().is_empty() {
+            if !child.checkers().is_empty() {
                 child_depth += 1;
             }
 
@@ -694,7 +770,7 @@ impl Searcher {
 
     fn probcut(
         &mut self,
-        position: &Position,
+        position: &NnuePosition,
         depth: i32,
         beta: i32,
         ply: usize,
@@ -709,7 +785,9 @@ impl Searcher {
         let moves: Vec<Move> = position
             .legal_moves()
             .into_iter()
-            .filter(|&mv| position.is_tactical(mv) && static_exchange_eval(position, mv) >= 0)
+            .filter(|&mv| {
+                position.is_tactical(mv) && static_exchange_eval(position.position(), mv) >= 0
+            })
             .collect();
         if moves.is_empty() {
             return None;
@@ -744,15 +822,21 @@ impl Searcher {
         None
     }
 
-    fn quiescence(&mut self, position: &Position, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+    fn quiescence(
+        &mut self,
+        position: &NnuePosition,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+    ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return evaluate(position);
+            return position.evaluate();
         }
         self.seldepth = self.seldepth.max(ply);
         self.nodes = self.nodes.saturating_add(1);
         if self.should_stop() {
             self.aborted = true;
-            return evaluate(position);
+            return position.evaluate();
         }
 
         if let Some(score) = terminal_score(position, ply) {
@@ -761,12 +845,15 @@ impl Searcher {
         if position.is_draw() {
             return 0;
         }
+        if let Some(score) = self.probe_syzygy_node(position, 0, ply) {
+            return score;
+        }
         if ply >= MAX_QS_PLY {
-            return evaluate(position);
+            return position.evaluate();
         }
 
-        let in_check = !position.board().checkers().is_empty();
-        let stand_pat = evaluate(position);
+        let in_check = !position.checkers().is_empty();
+        let stand_pat = position.evaluate();
         if !in_check {
             if stand_pat >= beta {
                 return stand_pat;
@@ -785,7 +872,7 @@ impl Searcher {
         for index in 0..moves.len() {
             let mv = pick_next(&mut moves, index);
             if !in_check {
-                let see = static_exchange_eval(position, mv);
+                let see = static_exchange_eval(position.position(), mv);
                 if see < -90 || stand_pat + see + 120 <= alpha {
                     continue;
                 }
@@ -809,7 +896,7 @@ impl Searcher {
 
     fn score_moves(
         &self,
-        position: &Position,
+        position: &NnuePosition,
         moves: Vec<Move>,
         tt_move: Option<Move>,
         ply: usize,
@@ -826,7 +913,7 @@ impl Searcher {
 
     fn move_score(
         &self,
-        position: &Position,
+        position: &NnuePosition,
         mv: Move,
         tt_move: Option<Move>,
         ply: usize,
@@ -841,17 +928,17 @@ impl Searcher {
             let victim = position.captured_piece(mv).map(piece_value).unwrap_or(0);
             let victim_piece = position.captured_piece(mv).unwrap_or(Piece::Pawn);
             let attacker = piece_value(moved);
-            let see = static_exchange_eval(position, mv);
+            let see = static_exchange_eval(position.position(), mv);
             let history =
-                self.capture_history[piece_index(moved)][piece_index(victim_piece)][mv.to as usize];
+                self.capture_history[piece_index(moved)][piece_index(victim_piece)][mv.to().to_usize()];
             if see >= 0 {
                 return 1_100_000 + see * 32 + victim * 16 - attacker + history;
             }
             return BAD_CAPTURE_BASE_SCORE + see * 32 + victim * 16 - attacker + history;
         }
 
-        if let Some(promotion) = mv.promotion {
-            let see = static_exchange_eval(position, mv);
+        if let Some(promotion) = mv.promotion() {
+            let see = static_exchange_eval(position.position(), mv);
             return 1_000_000 + see * 16 + piece_value(promotion);
         }
 
@@ -864,7 +951,7 @@ impl Searcher {
             }
         }
         if let Some(previous_move) = previous_move
-            && self.counter_moves[previous_move.from as usize][previous_move.to as usize]
+            && self.counter_moves[move_from(previous_move).to_usize()][previous_move.to().to_usize()]
                 == Some(mv)
         {
             return COUNTER_MOVE_SCORE;
@@ -873,15 +960,15 @@ impl Searcher {
         QUIET_BASE_SCORE + self.history_score(position, mv)
     }
 
-    fn history_score(&self, position: &Position, mv: Move) -> i32 {
+    fn history_score(&self, position: &NnuePosition, mv: Move) -> i32 {
         let side = position.side_to_move();
         let moved = position.moved_piece(mv).unwrap_or(Piece::Pawn);
-        self.quiet_history[color_index(side)][piece_index(moved)][mv.to as usize]
+        self.quiet_history[color_index(side)][piece_index(moved)][mv.to().to_usize()]
     }
 
     fn record_quiet_cutoff(
         &mut self,
-        position: &Position,
+        position: &NnuePosition,
         mv: Move,
         depth: i32,
         ply: usize,
@@ -893,7 +980,7 @@ impl Searcher {
             self.killers[ply][0] = Some(mv);
         }
         if let Some(previous_move) = previous_move {
-            self.counter_moves[previous_move.from as usize][previous_move.to as usize] = Some(mv);
+            self.counter_moves[move_from(previous_move).to_usize()][previous_move.to().to_usize()] = Some(mv);
         }
         let bonus = history_bonus(depth);
         self.update_quiet_history(position, mv, bonus);
@@ -904,7 +991,7 @@ impl Searcher {
         }
     }
 
-    fn record_capture_cutoff(&mut self, position: &Position, mv: Move, depth: i32) {
+    fn record_capture_cutoff(&mut self, position: &NnuePosition, mv: Move, depth: i32) {
         let Some(moved) = position.moved_piece(mv) else {
             return;
         };
@@ -912,20 +999,21 @@ impl Searcher {
             return;
         };
         let entry =
-            &mut self.capture_history[piece_index(moved)][piece_index(captured)][mv.to as usize];
+            &mut self.capture_history[piece_index(moved)][piece_index(captured)][mv.to().to_usize()];
         update_history_stat(entry, history_bonus(depth) / 2);
     }
 
-    fn update_quiet_history(&mut self, position: &Position, mv: Move, bonus: i32) {
+    fn update_quiet_history(&mut self, position: &NnuePosition, mv: Move, bonus: i32) {
         let side = position.side_to_move();
         let Some(moved) = position.moved_piece(mv) else {
             return;
         };
-        let entry = &mut self.quiet_history[color_index(side)][piece_index(moved)][mv.to as usize];
+        let entry = &mut self.quiet_history[color_index(side)][piece_index(moved)][mv.to().to_usize()];
         update_history_stat(entry, bonus);
     }
 
-    fn should_stop(&self) -> bool {
+    fn should_stop(&mut self) -> bool {
+        self.maybe_start_ponder_clock();
         if self.stop.load(Ordering::Relaxed) {
             return true;
         }
@@ -934,17 +1022,71 @@ impl Searcher {
         {
             return true;
         }
-        if self.nodes & TIME_CHECK_NODE_MASK == 0
-            && let Some(deadline) = self.hard_deadline
-        {
-            return Instant::now() >= deadline;
+        if let Some(deadline) = self.hard_deadline {
+            return self.hard_time_expired(deadline);
         }
         false
     }
 
-    fn soft_time_expired(&self) -> bool {
+    fn hard_time_expired(&mut self, deadline: Instant) -> bool {
+        if self.time_check_countdown > 0 {
+            self.time_check_countdown -= 1;
+            if self.time_check_countdown > 0 {
+                return false;
+            }
+        }
+
+        self.time_check_countdown = self.time_check_interval;
+        Instant::now() >= deadline
+    }
+
+    fn soft_time_expired(&mut self) -> bool {
+        self.maybe_start_ponder_clock();
         self.soft_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn maybe_start_ponder_clock(&mut self) {
+        if self.ponder_clock_started {
+            return;
+        }
+        let Some(ponder_hit) = &self.limits.ponder_hit else {
+            self.ponder_clock_started = true;
+            return;
+        };
+        if !ponder_hit.load(Ordering::Relaxed) {
+            return;
+        }
+
+        self.ponder_clock_started = true;
+        let clock_start = Instant::now();
+        let deadlines = self
+            .time_control()
+            .deadlines(self.root.side_to_move(), clock_start);
+        self.soft_deadline = deadlines.soft;
+        self.hard_deadline = deadlines.hard;
+    }
+
+    fn time_control(&self) -> TimeControl {
+        self.limits
+            .time_control(self.options.move_overhead, self.root_ply())
+    }
+
+    fn root_ply(&self) -> u32 {
+        self.root
+            .position()
+            .history()
+            .len()
+            .saturating_sub(1)
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
+    fn pondering_before_hit(&self) -> bool {
+        self.limits
+            .ponder_hit
+            .as_ref()
+            .is_some_and(|ponder_hit| !ponder_hit.load(Ordering::Relaxed))
     }
 
     fn can_extend_after_soft(&self, instability: u32, extensions_used: u32) -> bool {
@@ -970,7 +1112,7 @@ impl Searcher {
             let Some(mv) = entry.best_move else {
                 break;
             };
-            if !position.board().is_legal(mv) {
+            if !position.is_legal(mv) {
                 break;
             }
             pv.push(mv);
@@ -1004,8 +1146,66 @@ impl Searcher {
             nps,
             elapsed_ms,
             hashfull: self.tt.hashfull(),
+            tbhits: self.tbhits,
             pv: pv_uci,
         });
+    }
+
+    fn syzygy_root_outcome(&mut self, root_moves: &[Move]) -> Option<SearchOutcome> {
+        let (best_move, wdl) = self.syzygy_best_move(self.root.position())?;
+        if !root_moves.contains(&best_move) {
+            return None;
+        }
+
+        self.tbhits = self.tbhits.saturating_add(1);
+        let score = syzygy_score(wdl, 0, self.options.syzygy_50_move_rule);
+        let pv = vec![best_move];
+        self.report(0, score, &pv);
+        Some(SearchOutcome {
+            root: self.root.position().clone(),
+            best_move: Some(best_move),
+            score,
+            depth: 0,
+            nodes: self.nodes,
+            tbhits: self.tbhits,
+            elapsed: self.start.elapsed(),
+            pv,
+        })
+    }
+
+    fn syzygy_best_move(&self, position: &Position) -> Option<(Move, shakmaty_syzygy::Wdl)> {
+        let syzygy = self.options.syzygy.as_ref()?;
+        if !syzygy.can_probe(position, self.options.syzygy_probe_limit) {
+            return None;
+        }
+        syzygy.best_move(position, self.options.syzygy_50_move_rule)
+    }
+
+    fn probe_syzygy_node(
+        &mut self,
+        position: &NnuePosition,
+        depth: i32,
+        ply: usize,
+    ) -> Option<i32> {
+        if depth < self.options.syzygy_probe_depth as i32 {
+            return None;
+        }
+        let syzygy = self.options.syzygy.as_ref()?;
+        let position = position.position();
+        if position.halfmove_clock() != 0
+            || !syzygy.can_probe_at_depth(
+                position,
+                self.options.syzygy_probe_limit,
+                self.options.syzygy_probe_depth,
+                depth.max(0) as u32,
+            )
+        {
+            return None;
+        }
+
+        let wdl = syzygy.probe_wdl_after_zeroing(position)?;
+        self.tbhits = self.tbhits.saturating_add(1);
+        Some(syzygy_score(wdl, ply, self.options.syzygy_50_move_rule))
     }
 }
 
@@ -1038,6 +1238,14 @@ fn update_instability(
     next.min(6)
 }
 
+fn ensure_pv_starts_with(best_move: Move, pv: Vec<Move>) -> Vec<Move> {
+    if pv.first().copied() == Some(best_move) {
+        pv
+    } else {
+        vec![best_move]
+    }
+}
+
 fn history_bonus(depth: i32) -> i32 {
     (depth * depth * 128).clamp(128, MAX_HISTORY_SCORE / 2)
 }
@@ -1048,28 +1256,47 @@ fn update_history_stat(entry: &mut i32, bonus: i32) {
     *entry = (*entry).clamp(-MAX_HISTORY_SCORE, MAX_HISTORY_SCORE);
 }
 
+fn move_from(mv: Move) -> Square {
+    mv.from().expect("standard chess move has an origin square")
+}
+
 fn piece_index(piece: Piece) -> usize {
-    piece as usize
+    usize::from(piece) - 1
 }
 
 fn color_index(color: Color) -> usize {
-    color as usize
-}
-
-fn terminal_score(position: &Position, ply: usize) -> Option<i32> {
-    match position.board().status() {
-        GameStatus::Won => Some(-MATE + ply as i32),
-        GameStatus::Drawn => Some(0),
-        GameStatus::Ongoing => None,
+    match color {
+        Color::White => 0,
+        Color::Black => 1,
     }
 }
 
-fn has_non_pawn_material(position: &Position) -> bool {
+fn terminal_score(position: &NnuePosition, ply: usize) -> Option<i32> {
+    match position.known_outcome() {
+        Some(KnownOutcome::Decisive { .. }) => Some(-MATE + ply as i32),
+        Some(KnownOutcome::Draw) => Some(0),
+        None => None,
+    }
+}
+
+fn syzygy_score(wdl: shakmaty_syzygy::Wdl, ply: usize, use_50_move_rule: bool) -> i32 {
+    match wdl {
+        shakmaty_syzygy::Wdl::Win => TB_WIN_SCORE - ply as i32,
+        shakmaty_syzygy::Wdl::Loss => -TB_WIN_SCORE + ply as i32,
+        shakmaty_syzygy::Wdl::CursedWin if !use_50_move_rule => TB_WIN_SCORE - ply as i32,
+        shakmaty_syzygy::Wdl::BlessedLoss if !use_50_move_rule => -TB_WIN_SCORE + ply as i32,
+        shakmaty_syzygy::Wdl::Draw
+        | shakmaty_syzygy::Wdl::CursedWin
+        | shakmaty_syzygy::Wdl::BlessedLoss => 0,
+    }
+}
+
+fn has_non_pawn_material(position: &NnuePosition) -> bool {
     let side = position.side_to_move();
-    !(position.board().colored_pieces(side, Piece::Knight)
-        | position.board().colored_pieces(side, Piece::Bishop)
-        | position.board().colored_pieces(side, Piece::Rook)
-        | position.board().colored_pieces(side, Piece::Queen))
+    !((position.board().by_color(side) & position.board().by_role(Piece::Knight))
+        | (position.board().by_color(side) & position.board().by_role(Piece::Bishop))
+        | (position.board().by_color(side) & position.board().by_role(Piece::Rook))
+        | (position.board().by_color(side) & position.board().by_role(Piece::Queen)))
     .is_empty()
 }
 
@@ -1088,6 +1315,15 @@ fn late_move_pruning_threshold(depth: i32) -> usize {
         3 => 12,
         _ => usize::MAX,
     }
+}
+
+fn time_check_interval(limits: &SearchLimits) -> u32 {
+    limits
+        .nodes
+        .map(|nodes| {
+            (nodes / NODE_LIMIT_CHECK_DIVISOR).clamp(1, TIME_CHECK_INTERVAL_NODES as u64) as u32
+        })
+        .unwrap_or(TIME_CHECK_INTERVAL_NODES)
 }
 
 fn late_move_reduction(depth: i32, index: usize, history_score: i32, is_pv_node: bool) -> i32 {
@@ -1189,7 +1425,7 @@ mod tests {
         assert!(
             outcome
                 .best_move
-                .is_some_and(|mv| position.board().is_legal(mv))
+                .is_some_and(|mv| position.is_legal(mv))
         );
     }
 
@@ -1251,9 +1487,69 @@ mod tests {
         assert!(
             outcome
                 .best_move
-                .is_some_and(|mv| position.board().is_legal(mv))
+                .is_some_and(|mv| position.is_legal(mv))
         );
         assert!(!outcome.pv.is_empty());
+    }
+
+    #[test]
+    fn time_check_interval_matches_stockfish_node_policy() {
+        assert_eq!(time_check_interval(&SearchLimits::default()), 512);
+        assert_eq!(
+            time_check_interval(&SearchLimits {
+                nodes: Some(100),
+                ..SearchLimits::default()
+            }),
+            1
+        );
+        assert_eq!(
+            time_check_interval(&SearchLimits {
+                nodes: Some(2048),
+                ..SearchLimits::default()
+            }),
+            2
+        );
+        assert_eq!(
+            time_check_interval(&SearchLimits {
+                nodes: Some(1_000_000),
+                ..SearchLimits::default()
+            }),
+            512
+        );
+    }
+
+    #[test]
+    fn hard_clock_uses_countdown_between_now_calls() {
+        let position = Position::startpos();
+        let options = SearchOptions {
+            hash_mb: 4,
+            ..SearchOptions::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let tt = TranspositionTable::new(options.hash_mb);
+        let mut searcher =
+            Searcher::new(position, options, SearchLimits::default(), tt, stop, None);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        searcher.time_check_interval = 512;
+        searcher.time_check_countdown = 2;
+
+        assert!(!searcher.hard_time_expired(deadline));
+        assert!(searcher.hard_time_expired(deadline));
+        assert_eq!(searcher.time_check_countdown, 512);
+    }
+
+    #[test]
+    fn pv_is_sanitized_to_start_with_bestmove() {
+        let position = Position::startpos();
+        let best = position.uci_to_move("e2e4").unwrap();
+        let other = position.uci_to_move("d2d4").unwrap();
+
+        assert_eq!(
+            ensure_pv_starts_with(best, vec![best, other]),
+            vec![best, other]
+        );
+        assert_eq!(ensure_pv_starts_with(best, vec![other]), vec![best]);
+        assert_eq!(ensure_pv_starts_with(best, Vec::new()), vec![best]);
     }
 
     #[test]
@@ -1262,3 +1558,4 @@ mod tests {
         assert_eq!(format_uci_score(-MATE + 2), "mate -1");
     }
 }
+

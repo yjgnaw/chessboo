@@ -1,8 +1,10 @@
 [package]
 name = "chessboo"
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-cozy-chess = { version = "0.3.4", features = ["std"] }
+shakmaty = "0.30.0"
+shakmaty-syzygy = "0.28.0"
+viriformat = "3.0.0"
 vampirc-uci = "0.11.1"
