@@ -1558,4 +1558,3 @@ mod tests {
         assert_eq!(format_uci_score(-MATE + 2), "mate -1");
     }
 }
-

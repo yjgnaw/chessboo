@@ -21,13 +21,9 @@ It features a custom alpha-beta search, time management, Syzygy tablebase probin
 
 ## Building from Source
 
-Since pre-compiled platform binaries are not included in the repository, you will need to compile the engine from source using [Rust](https://www.rust-lang.org/tools/install) and `cargo`.
-
 ```shell
 git clone https://www.github.com/yjgnaw/chessboo.git
 cd chessboo
-
-# Build the release binary
 cargo build --release
 ```
 
@@ -35,7 +31,7 @@ The compiled binary will be located at `target/release/chessboo` (or `target\rel
 
 ## Usage
 
-Chessboo is an engine, not a graphical chess program. To play against it or use it for analysis, you should install a UCI-compatible Graphical User Interface (GUI) such as:
+Chessboo is an engine, not a graphical chess program. To play against it or use it for analysis, you should install a UCI-compatible Graphical User Interface such as:
 
 - [Cutechess](https://cutechess.com/)
 - [Arena Chess GUI](http://www.playwitharena.de/)
