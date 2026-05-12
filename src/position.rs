@@ -155,13 +155,18 @@ impl Position {
     }
 
     pub fn is_draw(&self) -> bool {
-        self.known_outcome() == Some(KnownOutcome::Draw)
-            || self.is_threefold_repetition()
-            || self.has_insufficient_material()
+        match self.board.outcome() {
+            Outcome::Known(KnownOutcome::Decisive { .. }) => false,
+            Outcome::Known(KnownOutcome::Draw) => true,
+            Outcome::Unknown => self.is_rule_draw_without_board_outcome(),
+        }
     }
 
     pub fn is_terminal(&self) -> bool {
-        self.known_outcome().is_some() || self.is_draw()
+        match self.board.outcome() {
+            Outcome::Known(_) => true,
+            Outcome::Unknown => self.is_rule_draw_without_board_outcome(),
+        }
     }
 
     pub fn known_outcome(&self) -> Option<KnownOutcome> {
@@ -213,9 +218,12 @@ impl Position {
             >= 3
     }
 
-    fn has_insufficient_material(&self) -> bool {
-        matches!(self.board.outcome(), Outcome::Known(KnownOutcome::Draw))
-            || self.board.is_insufficient_material()
+    fn is_rule_draw_without_board_outcome(&self) -> bool {
+        self.is_fifty_move_rule_draw() || self.is_threefold_repetition()
+    }
+
+    fn is_fifty_move_rule_draw(&self) -> bool {
+        self.board.halfmoves() >= 100
     }
 }
 
@@ -250,13 +258,31 @@ mod tests {
     #[test]
     fn bishops_on_same_color_are_insufficient_material() {
         let position = Position::from_fen("4k3/8/1b6/8/8/8/8/2B1K3 w - - 0 1").unwrap();
-        let white_bishop = (position.board().by_color(Color::White) & position.board().by_role(Role::Bishop))
-            .first()
-            .unwrap();
-        let black_bishop = (position.board().by_color(Color::Black) & position.board().by_role(Role::Bishop))
-            .first()
-            .unwrap();
+        let white_bishop = (position.board().by_color(Color::White)
+            & position.board().by_role(Role::Bishop))
+        .first()
+        .unwrap();
+        let black_bishop = (position.board().by_color(Color::Black)
+            & position.board().by_role(Role::Bishop))
+        .first()
+        .unwrap();
         assert_eq!(square_color(white_bishop), square_color(black_bishop));
         assert!(position.is_draw());
+    }
+
+    #[test]
+    fn fifty_move_rule_is_terminal_draw() {
+        let position = Position::from_fen("7k/8/8/8/8/8/8/KQ6 w - - 100 1").unwrap();
+        assert!(position.is_draw());
+        assert!(position.is_terminal());
+        assert_eq!(position.result_string(), "1/2-1/2");
+    }
+
+    #[test]
+    fn checkmate_is_not_overridden_by_fifty_move_rule() {
+        let position = Position::from_fen("7k/6Q1/7K/8/8/8/8/8 b - - 100 1").unwrap();
+        assert!(!position.is_draw());
+        assert!(position.is_terminal());
+        assert_eq!(position.result_string(), "1-0");
     }
 }

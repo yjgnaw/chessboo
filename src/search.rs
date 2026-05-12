@@ -245,6 +245,20 @@ impl Searcher {
             self.tt.new_search();
         }
 
+        if self.root.is_terminal() {
+            let score = terminal_score(&self.root, 0).unwrap_or(0);
+            return SearchOutcome {
+                root: self.root.position().clone(),
+                best_move: None,
+                score,
+                depth: 0,
+                nodes: self.nodes,
+                tbhits: self.tbhits,
+                elapsed: self.start.elapsed(),
+                pv: Vec::new(),
+            };
+        }
+
         let root_moves = self.root_moves();
         if root_moves.is_empty() {
             let score = terminal_score(&self.root, 0).unwrap_or(0);
@@ -929,8 +943,8 @@ impl Searcher {
             let victim_piece = position.captured_piece(mv).unwrap_or(Piece::Pawn);
             let attacker = piece_value(moved);
             let see = static_exchange_eval(position.position(), mv);
-            let history =
-                self.capture_history[piece_index(moved)][piece_index(victim_piece)][mv.to().to_usize()];
+            let history = self.capture_history[piece_index(moved)][piece_index(victim_piece)]
+                [mv.to().to_usize()];
             if see >= 0 {
                 return 1_100_000 + see * 32 + victim * 16 - attacker + history;
             }
@@ -951,7 +965,8 @@ impl Searcher {
             }
         }
         if let Some(previous_move) = previous_move
-            && self.counter_moves[move_from(previous_move).to_usize()][previous_move.to().to_usize()]
+            && self.counter_moves[move_from(previous_move).to_usize()]
+                [previous_move.to().to_usize()]
                 == Some(mv)
         {
             return COUNTER_MOVE_SCORE;
@@ -980,7 +995,8 @@ impl Searcher {
             self.killers[ply][0] = Some(mv);
         }
         if let Some(previous_move) = previous_move {
-            self.counter_moves[move_from(previous_move).to_usize()][previous_move.to().to_usize()] = Some(mv);
+            self.counter_moves[move_from(previous_move).to_usize()]
+                [previous_move.to().to_usize()] = Some(mv);
         }
         let bonus = history_bonus(depth);
         self.update_quiet_history(position, mv, bonus);
@@ -998,8 +1014,8 @@ impl Searcher {
         let Some(captured) = position.captured_piece(mv) else {
             return;
         };
-        let entry =
-            &mut self.capture_history[piece_index(moved)][piece_index(captured)][mv.to().to_usize()];
+        let entry = &mut self.capture_history[piece_index(moved)][piece_index(captured)]
+            [mv.to().to_usize()];
         update_history_stat(entry, history_bonus(depth) / 2);
     }
 
@@ -1008,7 +1024,8 @@ impl Searcher {
         let Some(moved) = position.moved_piece(mv) else {
             return;
         };
-        let entry = &mut self.quiet_history[color_index(side)][piece_index(moved)][mv.to().to_usize()];
+        let entry =
+            &mut self.quiet_history[color_index(side)][piece_index(moved)][mv.to().to_usize()];
         update_history_stat(entry, bonus);
     }
 
@@ -1422,11 +1439,7 @@ mod tests {
         let tt = TranspositionTable::new(options.hash_mb);
         let mut searcher = Searcher::new(position.clone(), options, limits, tt, stop, None);
         let outcome = searcher.search();
-        assert!(
-            outcome
-                .best_move
-                .is_some_and(|mv| position.is_legal(mv))
-        );
+        assert!(outcome.best_move.is_some_and(|mv| position.is_legal(mv)));
     }
 
     #[test]
@@ -1484,12 +1497,50 @@ mod tests {
         let mut searcher = Searcher::new(position.clone(), options, limits, tt, stop, None);
         let outcome = searcher.search();
         assert_eq!(outcome.depth, 4);
-        assert!(
-            outcome
-                .best_move
-                .is_some_and(|mv| position.is_legal(mv))
-        );
+        assert!(outcome.best_move.is_some_and(|mv| position.is_legal(mv)));
         assert!(!outcome.pv.is_empty());
+    }
+
+    #[test]
+    fn fifty_move_rule_root_returns_draw_without_move() {
+        let position = Position::from_fen("7k/8/8/8/8/8/8/KQ6 w - - 100 1").unwrap();
+        let options = SearchOptions {
+            hash_mb: 4,
+            ..SearchOptions::default()
+        };
+        let limits = SearchLimits {
+            depth: Some(4),
+            ..SearchLimits::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let tt = TranspositionTable::new(options.hash_mb);
+        let mut searcher = Searcher::new(position, options, limits, tt, stop, None);
+        let outcome = searcher.search();
+        assert_eq!(outcome.score, 0);
+        assert_eq!(outcome.depth, 0);
+        assert_eq!(outcome.best_move, None);
+        assert!(outcome.pv.is_empty());
+    }
+
+    #[test]
+    fn pv_stops_after_move_reaching_fifty_move_rule() {
+        let position = Position::from_fen("7k/8/8/8/8/8/8/KQ6 w - - 99 1").unwrap();
+        let options = SearchOptions {
+            hash_mb: 4,
+            ..SearchOptions::default()
+        };
+        let limits = SearchLimits {
+            depth: Some(4),
+            ..SearchLimits::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let tt = TranspositionTable::new(options.hash_mb);
+        let mut searcher = Searcher::new(position, options, limits, tt, stop, None);
+        let outcome = searcher.search();
+        assert!(outcome.pv.len() <= 1);
+        if let Some(&mv) = outcome.pv.first() {
+            assert!(outcome.root.after_move(mv).is_terminal());
+        }
     }
 
     #[test]

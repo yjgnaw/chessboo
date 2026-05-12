@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -369,6 +369,93 @@ struct WorkerResult {
     tt: TranspositionTable,
 }
 
+struct ThreadedReporter {
+    stats: Arc<Mutex<ThreadedReporterStats>>,
+    reporter: Arc<Mutex<SearchReporter>>,
+}
+
+#[derive(Debug)]
+struct ThreadedReporterStats {
+    latest: Vec<Option<SearchInfo>>,
+    emitted_depth: u32,
+}
+
+impl ThreadedReporter {
+    fn new(worker_count: usize, reporter: SearchReporter) -> Self {
+        Self {
+            stats: Arc::new(Mutex::new(ThreadedReporterStats {
+                latest: vec![None; worker_count],
+                emitted_depth: 0,
+            })),
+            reporter: Arc::new(Mutex::new(reporter)),
+        }
+    }
+
+    fn reporter_for(&self, worker_index: usize) -> SearchReporter {
+        let stats = Arc::clone(&self.stats);
+        let reporter = Arc::clone(&self.reporter);
+        Box::new(move |info| {
+            let mut stats = stats.lock().expect("threaded reporter stats lock poisoned");
+            let aggregated = aggregate_thread_info(&mut stats, worker_index, info);
+            if let Some(aggregated) = aggregated {
+                let reporter = reporter.lock().expect("threaded reporter lock poisoned");
+                reporter.as_ref()(aggregated);
+            }
+        })
+    }
+}
+
+fn aggregate_thread_info(
+    stats: &mut ThreadedReporterStats,
+    worker_index: usize,
+    info: SearchInfo,
+) -> Option<SearchInfo> {
+    if let Some(slot) = stats.latest.get_mut(worker_index) {
+        *slot = Some(info.clone());
+    }
+    if info.depth <= stats.emitted_depth {
+        return None;
+    }
+    if !stats.latest.iter().all(|latest| {
+        latest
+            .as_ref()
+            .is_some_and(|latest| latest.depth >= info.depth)
+    }) {
+        return None;
+    }
+
+    let mut aggregate = info;
+    aggregate.nodes = stats
+        .latest
+        .iter()
+        .flatten()
+        .fold(0_u64, |nodes, info| nodes.saturating_add(info.nodes));
+    aggregate.tbhits = stats
+        .latest
+        .iter()
+        .flatten()
+        .fold(0_u64, |tbhits, info| tbhits.saturating_add(info.tbhits));
+    aggregate.seldepth = stats
+        .latest
+        .iter()
+        .flatten()
+        .map(|info| info.seldepth)
+        .max()
+        .unwrap_or(aggregate.seldepth);
+    aggregate.elapsed_ms = stats
+        .latest
+        .iter()
+        .flatten()
+        .map(|info| info.elapsed_ms)
+        .max()
+        .unwrap_or(aggregate.elapsed_ms)
+        .max(1);
+    aggregate.nps = aggregate.nodes.saturating_mul(1000) / aggregate.elapsed_ms as u64;
+
+    stats.emitted_depth = aggregate.depth;
+    Some(aggregate)
+}
+
 fn search_with_threads(
     position: Position,
     options: SearchOptions,
@@ -396,7 +483,7 @@ fn search_with_threads(
     let started = Instant::now();
     let node_limit = limits.nodes;
     let mut handles = Vec::with_capacity(worker_count);
-    let mut reporter = Some(reporter);
+    let threaded_reporter = ThreadedReporter::new(worker_count, reporter);
     tt.new_search();
 
     for index in 0..worker_count {
@@ -412,7 +499,7 @@ fn search_with_threads(
         }
 
         let stop = Arc::clone(&stop);
-        let reporter = if index == 0 { reporter.take() } else { None };
+        let reporter = Some(threaded_reporter.reporter_for(index));
         let tt = tt.clone();
         handles.push(thread::spawn(move || {
             let mut searcher = Searcher::new(position, options, limits, tt, stop, reporter);
@@ -920,6 +1007,56 @@ mod tests {
         assert_eq!(outcome.score, 25);
         assert_eq!(outcome.nodes, 600);
         assert_eq!(outcome.tbhits, 7);
+    }
+
+    #[test]
+    fn threaded_reporter_aggregates_nodes_and_nps() {
+        let root = Position::startpos();
+        let e2e4 = root.uci_to_move("e2e4").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_reporter = Arc::clone(&seen);
+        let reporter = ThreadedReporter::new(
+            2,
+            Box::new(move |info| {
+                seen_for_reporter
+                    .lock()
+                    .expect("seen lock poisoned")
+                    .push(info);
+            }),
+        );
+        let worker_0 = reporter.reporter_for(0);
+        let worker_1 = reporter.reporter_for(1);
+
+        worker_0(SearchInfo {
+            depth: 3,
+            seldepth: 5,
+            score: 12,
+            nodes: 100,
+            nps: 1,
+            elapsed_ms: 10,
+            hashfull: 0,
+            tbhits: 1,
+            pv: vec![root.to_uci(e2e4)],
+        });
+        assert!(seen.lock().expect("seen lock poisoned").is_empty());
+        worker_1(SearchInfo {
+            depth: 3,
+            seldepth: 7,
+            score: 20,
+            nodes: 250,
+            nps: 1,
+            elapsed_ms: 10,
+            hashfull: 0,
+            tbhits: 2,
+            pv: vec![root.to_uci(e2e4)],
+        });
+
+        let seen = seen.lock().expect("seen lock poisoned");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].nodes, 350);
+        assert_eq!(seen[0].nps, 35_000);
+        assert_eq!(seen[0].seldepth, 7);
+        assert_eq!(seen[0].tbhits, 3);
     }
 
     #[test]
