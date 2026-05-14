@@ -475,6 +475,7 @@ fn search_with_threads(
         effective_thread_count(options.threads, root_moves.len())
     };
     if worker_count <= 1 {
+        let tt = tt.into_local();
         let mut searcher = Searcher::new(position, options, limits, tt, stop, Some(reporter));
         let outcome = searcher.search();
         return (outcome, searcher.into_tt());
@@ -484,6 +485,7 @@ fn search_with_threads(
     let node_limit = limits.nodes;
     let mut handles = Vec::with_capacity(worker_count);
     let threaded_reporter = ThreadedReporter::new(worker_count, reporter);
+    let tt = tt.into_shared();
     tt.new_search();
 
     for index in 0..worker_count {
@@ -522,7 +524,7 @@ fn search_with_threads(
 }
 
 fn root_moves_for_limits(position: &Position, limits: &SearchLimits) -> Vec<Move> {
-    let mut moves = position.legal_moves();
+    let mut moves: Vec<Move> = position.legal_moves().into_iter().collect();
     if !limits.search_moves.is_empty() {
         moves = limits
             .search_moves

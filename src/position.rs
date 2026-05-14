@@ -1,17 +1,26 @@
 use std::fmt;
+use std::sync::Arc;
 
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{
-    Bitboard, Board, CastlingMode, Chess, Color, EnPassantMode, KnownOutcome, Move, Outcome,
-    Position as ShakmatyPosition, Role, Square,
+    Bitboard, Board, CastlingMode, Chess, Color, EnPassantMode, KnownOutcome, Move, MoveList,
+    Outcome, Position as ShakmatyPosition, Role, Square,
 };
 
 #[derive(Debug, Clone)]
 pub struct Position {
     board: Chess,
-    history: Vec<u64>,
+    history: Arc<HistoryNode>,
+    hash: u64,
+}
+
+#[derive(Debug)]
+struct HistoryNode {
+    hash: u64,
+    previous: Option<Arc<HistoryNode>>,
+    len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +33,29 @@ impl fmt::Display for PositionError {
 }
 
 impl std::error::Error for PositionError {}
+
+impl HistoryNode {
+    fn root(hash: u64) -> Arc<Self> {
+        Arc::new(Self {
+            hash,
+            previous: None,
+            len: 1,
+        })
+    }
+
+    fn push(previous: &Arc<Self>, hash: u64) -> Arc<Self> {
+        Arc::new(Self {
+            hash,
+            previous: Some(Arc::clone(previous)),
+            len: previous.len + 1,
+        })
+    }
+}
+
+fn compute_hash(board: &Chess) -> u64 {
+    let Zobrist64(hash) = board.zobrist_hash(EnPassantMode::Legal);
+    hash
+}
 
 impl Position {
     pub const STARTPOS_FEN: &'static str =
@@ -46,12 +78,12 @@ impl Position {
     }
 
     pub fn from_chess(board: Chess) -> Self {
-        let mut position = Self {
+        let hash = compute_hash(&board);
+        Self {
             board,
-            history: Vec::with_capacity(128),
-        };
-        position.push_history();
-        position
+            history: HistoryNode::root(hash),
+            hash,
+        }
     }
 
     pub fn board(&self) -> &Board {
@@ -67,20 +99,19 @@ impl Position {
     }
 
     pub fn hash(&self) -> u64 {
-        let Zobrist64(hash) = self.board.zobrist_hash(EnPassantMode::Legal);
-        hash
+        self.hash
     }
 
     pub fn repetition_hash(&self) -> u64 {
         self.hash()
     }
 
-    pub fn history(&self) -> &[u64] {
-        &self.history
+    pub fn ply(&self) -> usize {
+        self.history.len.saturating_sub(1)
     }
 
-    pub fn legal_moves(&self) -> Vec<Move> {
-        self.board.legal_moves().into_iter().collect()
+    pub fn legal_moves(&self) -> MoveList {
+        self.board.legal_moves()
     }
 
     pub fn is_legal(&self, mv: Move) -> bool {
@@ -116,6 +147,7 @@ impl Position {
             return Err(PositionError(format!("illegal move {}", self.to_uci(mv))));
         }
         self.board.play_unchecked(mv);
+        self.hash = compute_hash(&self.board);
         self.push_history();
         Ok(())
     }
@@ -123,15 +155,18 @@ impl Position {
     pub fn after_move(&self, mv: Move) -> Self {
         let mut next = self.clone();
         next.board.play_unchecked(mv);
+        next.hash = compute_hash(&next.board);
         next.push_history();
         next
     }
 
     pub fn null_move(&self) -> Option<Self> {
         let board = self.board.clone().swap_turn().ok()?;
+        let hash = compute_hash(&board);
         Some(Self {
             board,
-            history: self.history.clone(),
+            history: Arc::clone(&self.history),
+            hash,
         })
     }
 
@@ -204,18 +239,28 @@ impl Position {
         !self.is_capture(mv) && mv.promotion().is_none()
     }
 
+    pub fn is_rule_draw(&self) -> bool {
+        self.is_rule_draw_without_board_outcome() || self.board.is_insufficient_material()
+    }
+
     fn push_history(&mut self) {
-        self.history.push(self.repetition_hash());
+        self.history = HistoryNode::push(&self.history, self.repetition_hash());
     }
 
     fn is_threefold_repetition(&self) -> bool {
         let key = self.repetition_hash();
-        self.history
-            .iter()
-            .rev()
-            .filter(|&&hash| hash == key)
-            .count()
-            >= 3
+        let mut count = 0;
+        let mut node = Some(self.history.as_ref());
+        while let Some(history) = node {
+            if history.hash == key {
+                count += 1;
+                if count >= 3 {
+                    return true;
+                }
+            }
+            node = history.previous.as_deref();
+        }
+        false
     }
 
     fn is_rule_draw_without_board_outcome(&self) -> bool {

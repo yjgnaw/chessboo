@@ -1,4 +1,5 @@
 use shakmaty::Move;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,18 +34,30 @@ struct Cluster {
 }
 
 pub struct TranspositionTable {
-    clusters: Arc<Vec<Mutex<Cluster>>>,
+    storage: TableStorage,
     used: Arc<AtomicUsize>,
     generation: Arc<AtomicU8>,
+}
+
+enum TableStorage {
+    Local(Box<[UnsafeCell<Cluster>]>),
+    Shared(Arc<Vec<Mutex<Cluster>>>),
 }
 
 impl TranspositionTable {
     pub fn new(hash_mb: usize) -> Self {
         let bytes = hash_mb.max(1).saturating_mul(1024 * 1024);
+        // Keep the v1.0.x cluster count for a given Hash value. Changing TT geometry changes
+        // collisions, cutoffs, and therefore selective-search scores at fixed depth.
         let cluster_size = std::mem::size_of::<Mutex<Cluster>>().max(1);
         let len = (bytes / cluster_size).max(256);
         Self {
-            clusters: Arc::new((0..len).map(|_| Mutex::new(Cluster::default())).collect()),
+            storage: TableStorage::Local(
+                (0..len)
+                    .map(|_| UnsafeCell::new(Cluster::default()))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
             used: Arc::new(AtomicUsize::new(0)),
             generation: Arc::new(AtomicU8::new(0)),
         }
@@ -55,102 +68,211 @@ impl TranspositionTable {
     }
 
     pub fn clear(&self) {
-        for cluster in self.clusters.iter() {
-            *cluster.lock().expect("tt cluster lock poisoned") = Cluster::default();
+        match &self.storage {
+            TableStorage::Local(clusters) => {
+                for cluster in clusters.iter() {
+                    // Local tables are owned by one search thread; this avoids a lock in the hot path.
+                    unsafe {
+                        *cluster.get() = Cluster::default();
+                    }
+                }
+            }
+            TableStorage::Shared(clusters) => {
+                for cluster in clusters.iter() {
+                    *cluster.lock().expect("tt cluster lock poisoned") = Cluster::default();
+                }
+            }
         }
         self.used.store(0, Ordering::Relaxed);
         self.generation.store(0, Ordering::Relaxed);
     }
 
     pub fn probe(&self, key: u64) -> Option<Entry> {
-        let cluster = self.clusters[self.index(key)]
-            .lock()
-            .expect("tt cluster lock poisoned");
-        cluster
-            .entries
-            .iter()
-            .flatten()
-            .find_map(|stored| (stored.entry.key == key).then_some(stored.entry))
+        match &self.storage {
+            TableStorage::Local(clusters) => {
+                let cluster = unsafe { &*clusters[self.index(key)].get() };
+                probe_cluster(cluster, key)
+            }
+            TableStorage::Shared(clusters) => {
+                let cluster = clusters[self.index(key)]
+                    .lock()
+                    .expect("tt cluster lock poisoned");
+                probe_cluster(&cluster, key)
+            }
+        }
     }
 
     pub fn store(&self, entry: Entry) {
         let index = self.index(entry.key);
         let generation = self.generation.load(Ordering::Relaxed);
-        let mut cluster = self.clusters[index]
-            .lock()
-            .expect("tt cluster lock poisoned");
-
-        if let Some(slot) = cluster
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|stored| stored.entry.key == entry.key))
-        {
-            let old = slot.expect("matched occupied slot");
-            if entry.depth >= old.entry.depth
-                || entry.bound == Bound::Exact
-                || old.generation != generation
-            {
-                *slot = Some(StoredEntry { entry, generation });
+        match &self.storage {
+            TableStorage::Local(clusters) => {
+                let cluster = unsafe { &mut *clusters[index].get() };
+                store_cluster(cluster, entry, generation, &self.used);
             }
-            return;
+            TableStorage::Shared(clusters) => {
+                let mut cluster = clusters[index].lock().expect("tt cluster lock poisoned");
+                store_cluster(&mut cluster, entry, generation, &self.used);
+            }
         }
-
-        if let Some(slot) = cluster.entries.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(StoredEntry { entry, generation });
-            self.used.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        let replace_index = cluster
-            .entries
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, slot)| replacement_priority(slot.expect("occupied slot"), generation))
-            .map(|(slot, _)| slot)
-            .expect("cluster has slots");
-
-        cluster.entries[replace_index] = Some(StoredEntry { entry, generation });
     }
 
     pub fn hashfull(&self) -> u64 {
-        let sample_clusters = self.clusters.len().min(HASHFULL_SAMPLE_CLUSTERS);
+        let sample_clusters = self.cluster_count().min(HASHFULL_SAMPLE_CLUSTERS);
         if sample_clusters == 0 {
             return 0;
         }
 
         let generation = self.generation.load(Ordering::Relaxed);
-        let current_generation_entries = self
-            .clusters
-            .iter()
-            .take(sample_clusters)
-            .map(|cluster| {
-                cluster
-                    .lock()
-                    .expect("tt cluster lock poisoned")
-                    .entries
-                    .iter()
-                    .flatten()
-                    .filter(|stored| stored.generation == generation)
-                    .count()
-            })
-            .sum::<usize>();
+        let current_generation_entries = match &self.storage {
+            TableStorage::Local(clusters) => clusters
+                .iter()
+                .take(sample_clusters)
+                .map(|cluster| {
+                    unsafe { &*cluster.get() }
+                        .entries
+                        .iter()
+                        .flatten()
+                        .filter(|stored| stored.generation == generation)
+                        .count()
+                })
+                .sum::<usize>(),
+            TableStorage::Shared(clusters) => clusters
+                .iter()
+                .take(sample_clusters)
+                .map(|cluster| {
+                    cluster
+                        .lock()
+                        .expect("tt cluster lock poisoned")
+                        .entries
+                        .iter()
+                        .flatten()
+                        .filter(|stored| stored.generation == generation)
+                        .count()
+                })
+                .sum::<usize>(),
+        };
         let sampled_slots = sample_clusters * CLUSTER_SIZE;
         (current_generation_entries as u64 * 1000) / sampled_slots as u64
     }
 
+    pub fn into_local(self) -> Self {
+        match self.storage {
+            TableStorage::Local(clusters) => Self {
+                storage: TableStorage::Local(clusters),
+                used: self.used,
+                generation: self.generation,
+            },
+            TableStorage::Shared(clusters) => Self {
+                storage: TableStorage::Local(
+                    clusters
+                        .iter()
+                        .map(|cluster| {
+                            UnsafeCell::new(*cluster.lock().expect("tt cluster lock poisoned"))
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+                used: self.used,
+                generation: self.generation,
+            },
+        }
+    }
+
+    pub fn into_shared(self) -> Self {
+        match self.storage {
+            TableStorage::Shared(clusters) => Self {
+                storage: TableStorage::Shared(clusters),
+                used: self.used,
+                generation: self.generation,
+            },
+            TableStorage::Local(clusters) => Self {
+                storage: TableStorage::Shared(Arc::new(
+                    clusters
+                        .iter()
+                        .map(|cluster| Mutex::new(unsafe { *cluster.get() }))
+                        .collect(),
+                )),
+                used: self.used,
+                generation: self.generation,
+            },
+        }
+    }
+
     fn index(&self, key: u64) -> usize {
-        key as usize % self.clusters.len()
+        key as usize % self.cluster_count()
+    }
+
+    fn cluster_count(&self) -> usize {
+        match &self.storage {
+            TableStorage::Local(clusters) => clusters.len(),
+            TableStorage::Shared(clusters) => clusters.len(),
+        }
     }
 }
 
 impl Clone for TranspositionTable {
     fn clone(&self) -> Self {
-        Self {
-            clusters: Arc::clone(&self.clusters),
-            used: Arc::clone(&self.used),
-            generation: Arc::clone(&self.generation),
+        match &self.storage {
+            TableStorage::Local(clusters) => Self {
+                storage: TableStorage::Local(
+                    clusters
+                        .iter()
+                        .map(|cluster| UnsafeCell::new(unsafe { *cluster.get() }))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+                used: Arc::new(AtomicUsize::new(self.used.load(Ordering::Relaxed))),
+                generation: Arc::new(AtomicU8::new(self.generation.load(Ordering::Relaxed))),
+            },
+            TableStorage::Shared(clusters) => Self {
+                storage: TableStorage::Shared(Arc::clone(clusters)),
+                used: Arc::clone(&self.used),
+                generation: Arc::clone(&self.generation),
+            },
         }
     }
+}
+
+fn probe_cluster(cluster: &Cluster, key: u64) -> Option<Entry> {
+    cluster
+        .entries
+        .iter()
+        .flatten()
+        .find_map(|stored| (stored.entry.key == key).then_some(stored.entry))
+}
+
+fn store_cluster(cluster: &mut Cluster, entry: Entry, generation: u8, used: &AtomicUsize) {
+    if let Some(slot) = cluster
+        .entries
+        .iter_mut()
+        .find(|slot| slot.is_some_and(|stored| stored.entry.key == entry.key))
+    {
+        let old = slot.expect("matched occupied slot");
+        if entry.depth >= old.entry.depth
+            || entry.bound == Bound::Exact
+            || old.generation != generation
+        {
+            *slot = Some(StoredEntry { entry, generation });
+        }
+        return;
+    }
+
+    if let Some(slot) = cluster.entries.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(StoredEntry { entry, generation });
+        used.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let replace_index = cluster
+        .entries
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, slot)| replacement_priority(slot.expect("occupied slot"), generation))
+        .map(|(slot, _)| slot)
+        .expect("cluster has slots");
+
+    cluster.entries[replace_index] = Some(StoredEntry { entry, generation });
 }
 
 fn replacement_priority(entry: StoredEntry, generation: u8) -> i32 {
@@ -183,7 +305,7 @@ mod tests {
     #[test]
     fn cluster_probe_finds_colliding_entries() {
         let tt = TranspositionTable::new(1);
-        let stride = tt.clusters.len() as u64;
+        let stride = tt.cluster_count() as u64;
         for i in 0..CLUSTER_SIZE {
             tt.store(entry(1 + stride * i as u64, i as i16 + 1, Bound::Lower));
         }
@@ -198,7 +320,7 @@ mod tests {
     #[test]
     fn replacement_prefers_stale_shallow_non_exact_entries() {
         let tt = TranspositionTable::new(1);
-        let stride = tt.clusters.len() as u64;
+        let stride = tt.cluster_count() as u64;
         tt.store(entry(2, 8, Bound::Exact));
         tt.store(entry(2 + stride, 2, Bound::Upper));
         tt.store(entry(2 + stride * 2, 7, Bound::Lower));
@@ -215,7 +337,7 @@ mod tests {
     #[test]
     fn hashfull_counts_only_current_generation_entries() {
         let tt = TranspositionTable::new(1);
-        let stride = tt.clusters.len() as u64;
+        let stride = tt.cluster_count() as u64;
         for i in 0..CLUSTER_SIZE {
             tt.store(entry(stride * i as u64, i as i16 + 1, Bound::Lower));
         }

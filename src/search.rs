@@ -386,7 +386,7 @@ impl Searcher {
     }
 
     fn root_moves(&self) -> Vec<Move> {
-        let mut moves = self.root.legal_moves();
+        let mut moves: Vec<Move> = self.root.legal_moves().into_iter().collect();
         if !self.limits.search_moves.is_empty() {
             moves = self
                 .limits
@@ -513,11 +513,21 @@ impl Searcher {
             return position.evaluate();
         }
 
-        if let Some(score) = terminal_score(position, ply) {
-            return score;
-        }
-        if position.is_draw() {
+        let in_check = !position.checkers().is_empty();
+        let rule_draw = position.is_rule_draw();
+        if rule_draw && !in_check {
             return 0;
+        }
+        let mut legal_moves = None;
+        if in_check {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                return no_legal_move_score(in_check, ply);
+            }
+            if rule_draw {
+                return 0;
+            }
+            legal_moves = Some(moves);
         }
         if let Some(score) = self.probe_syzygy_node(position, depth, ply) {
             return score;
@@ -526,7 +536,6 @@ impl Searcher {
             return self.quiescence(position, alpha, beta, ply);
         }
 
-        let in_check = !position.checkers().is_empty();
         if in_check && ply < MAX_CHECK_EXTENSION_PLY {
             depth += 1;
         }
@@ -606,9 +615,12 @@ impl Searcher {
             return score;
         }
 
-        let moves = position.legal_moves();
+        let moves = legal_moves.unwrap_or_else(|| position.legal_moves());
         if moves.is_empty() {
-            return terminal_score(position, ply).unwrap_or(0);
+            return no_legal_move_score(in_check, ply);
+        }
+        if rule_draw {
+            return 0;
         }
         let mut moves = self.score_moves(
             position,
@@ -853,11 +865,21 @@ impl Searcher {
             return position.evaluate();
         }
 
-        if let Some(score) = terminal_score(position, ply) {
-            return score;
-        }
-        if position.is_draw() {
+        let in_check = !position.checkers().is_empty();
+        let rule_draw = position.is_rule_draw();
+        if rule_draw && !in_check {
             return 0;
+        }
+        let mut legal_moves = None;
+        if in_check {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                return no_legal_move_score(in_check, ply);
+            }
+            if rule_draw {
+                return 0;
+            }
+            legal_moves = Some(moves);
         }
         if let Some(score) = self.probe_syzygy_node(position, 0, ply) {
             return score;
@@ -866,7 +888,14 @@ impl Searcher {
             return position.evaluate();
         }
 
-        let in_check = !position.checkers().is_empty();
+        let mut moves = legal_moves.unwrap_or_else(|| position.legal_moves());
+        if moves.is_empty() {
+            return no_legal_move_score(in_check, ply);
+        }
+        if rule_draw {
+            return 0;
+        }
+
         let stand_pat = position.evaluate();
         if !in_check {
             if stand_pat >= beta {
@@ -877,7 +906,6 @@ impl Searcher {
             }
         }
 
-        let mut moves = position.legal_moves();
         if !in_check {
             moves.retain(|mv| position.is_tactical(*mv));
         }
@@ -908,14 +936,17 @@ impl Searcher {
         alpha
     }
 
-    fn score_moves(
+    fn score_moves<I>(
         &self,
         position: &NnuePosition,
-        moves: Vec<Move>,
+        moves: I,
         tt_move: Option<Move>,
         ply: usize,
         previous_move: Option<Move>,
-    ) -> Vec<ScoredMove> {
+    ) -> Vec<ScoredMove>
+    where
+        I: IntoIterator<Item = Move>,
+    {
         moves
             .into_iter()
             .map(|mv| ScoredMove {
@@ -1090,13 +1121,7 @@ impl Searcher {
     }
 
     fn root_ply(&self) -> u32 {
-        self.root
-            .position()
-            .history()
-            .len()
-            .saturating_sub(1)
-            .try_into()
-            .unwrap_or(u32::MAX)
+        self.root.position().ply().try_into().unwrap_or(u32::MAX)
     }
 
     fn pondering_before_hit(&self) -> bool {
@@ -1294,6 +1319,10 @@ fn terminal_score(position: &NnuePosition, ply: usize) -> Option<i32> {
         Some(KnownOutcome::Draw) => Some(0),
         None => None,
     }
+}
+
+fn no_legal_move_score(in_check: bool, ply: usize) -> i32 {
+    if in_check { -MATE + ply as i32 } else { 0 }
 }
 
 fn syzygy_score(wdl: shakmaty_syzygy::Wdl, ply: usize, use_50_move_rule: bool) -> i32 {

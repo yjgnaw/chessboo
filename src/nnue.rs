@@ -3,7 +3,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use shakmaty::{Bitboard, Board, Color, File, KnownOutcome, Move, Rank, Role as Piece, Square};
+use shakmaty::{
+    Bitboard, Board, Color, File, KnownOutcome, Move, MoveList, Rank, Role as Piece, Square,
+};
 
 use crate::eval::evaluate;
 use crate::position::Position;
@@ -234,22 +236,23 @@ impl NnueNet {
 }
 
 impl DenseWeights {
+    #[inline(always)]
     fn add_feature(&self, accumulator: &mut Accumulator, feature: usize) {
         let offset = feature * HIDDEN_SIZE;
         for index in 0..HIDDEN_SIZE {
-            accumulator.values[index] =
-                accumulator.values[index].saturating_add(self.l0_weights[offset + index]);
+            accumulator.values[index] += self.l0_weights[offset + index];
         }
     }
 
+    #[inline(always)]
     fn remove_feature(&self, accumulator: &mut Accumulator, feature: usize) {
         let offset = feature * HIDDEN_SIZE;
         for index in 0..HIDDEN_SIZE {
-            accumulator.values[index] =
-                accumulator.values[index].saturating_sub(self.l0_weights[offset + index]);
+            accumulator.values[index] -= self.l0_weights[offset + index];
         }
     }
 
+    #[inline(always)]
     fn evaluate(&self, side_to_move: Color, accumulators: &AccumulatorPair) -> i32 {
         let (us, them) = accumulators.by_side(side_to_move);
         let mut output = 0_i64;
@@ -346,7 +349,7 @@ impl NnuePosition {
         self.position.hash()
     }
 
-    pub fn legal_moves(&self) -> Vec<Move> {
+    pub fn legal_moves(&self) -> MoveList {
         self.position.legal_moves()
     }
 
@@ -370,13 +373,13 @@ impl NnuePosition {
             return Self::new(self.position.after_move(mv), Some(Arc::clone(net)));
         };
 
-        let before = self.position.clone();
+        let before = &self.position;
         let mut next = Self {
-            position: self.position.after_move(mv),
+            position: before.after_move(mv),
             accumulators: Some(accumulators.clone()),
             net: Some(Arc::clone(net)),
         };
-        next.update_accumulators_for_move(&before, mv);
+        next.update_accumulators_for_move(before, mv, net);
         next
     }
 
@@ -401,6 +404,10 @@ impl NnuePosition {
 
     pub fn is_draw(&self) -> bool {
         self.position.is_draw()
+    }
+
+    pub fn is_rule_draw(&self) -> bool {
+        self.position.is_rule_draw()
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -440,10 +447,7 @@ impl NnuePosition {
             .is_some_and(|accumulators| *accumulators == net.accumulator_pair(&self.position))
     }
 
-    fn update_accumulators_for_move(&mut self, before: &Position, mv: Move) {
-        let Some(net) = self.net.clone() else {
-            return;
-        };
+    fn update_accumulators_for_move(&mut self, before: &Position, mv: Move, net: &NnueNet) {
         let Some(accumulators) = &mut self.accumulators else {
             return;
         };
@@ -452,74 +456,25 @@ impl NnuePosition {
 
         if before.is_internal_castle_move(mv) {
             let (king_to, rook_to) = castle_target_squares(mv, moving_color);
-            remove_piece_features(
-                &net,
-                accumulators,
-                before.board(),
-                moving_color,
-                Piece::King,
-                move_from(mv),
-            );
-            remove_piece_features(
-                &net,
-                accumulators,
-                before.board(),
-                moving_color,
-                Piece::Rook,
-                mv.to(),
-            );
-            add_piece_features(
-                &net,
-                accumulators,
-                self.position.board(),
-                moving_color,
-                Piece::King,
-                king_to,
-            );
-            add_piece_features(
-                &net,
-                accumulators,
-                self.position.board(),
-                moving_color,
-                Piece::Rook,
-                rook_to,
-            );
+            remove_piece_features(net, accumulators, moving_color, Piece::King, move_from(mv));
+            remove_piece_features(net, accumulators, moving_color, Piece::Rook, mv.to());
+            add_piece_features(net, accumulators, moving_color, Piece::King, king_to);
+            add_piece_features(net, accumulators, moving_color, Piece::Rook, rook_to);
             debug_assert!(self.refresh_matches());
             return;
         }
 
-        remove_piece_features(
-            &net,
-            accumulators,
-            before.board(),
-            moving_color,
-            moving_piece,
-            move_from(mv),
-        );
+        remove_piece_features(net, accumulators, moving_color, moving_piece, move_from(mv));
         if let Some(captured) = before.captured_piece(mv) {
             let captured_square = if before.is_en_passant_move(mv) {
                 en_passant_captured_square(mv, moving_color)
             } else {
                 mv.to()
             };
-            remove_piece_features(
-                &net,
-                accumulators,
-                before.board(),
-                !moving_color,
-                captured,
-                captured_square,
-            );
+            remove_piece_features(net, accumulators, !moving_color, captured, captured_square);
         }
         let placed_piece = mv.promotion().unwrap_or(moving_piece);
-        add_piece_features(
-            &net,
-            accumulators,
-            self.position.board(),
-            moving_color,
-            placed_piece,
-            mv.to(),
-        );
+        add_piece_features(net, accumulators, moving_color, placed_piece, mv.to());
 
         debug_assert!(self.refresh_matches());
     }
@@ -531,6 +486,7 @@ struct FeaturePair {
     black: usize,
 }
 
+#[inline(always)]
 pub fn feature_index(
     perspective: Color,
     piece_color: Color,
@@ -561,10 +517,10 @@ fn active_features(board: &Board) -> Vec<FeaturePair> {
     features
 }
 
+#[inline(always)]
 fn add_piece_features(
     net: &NnueNet,
     accumulators: &mut AccumulatorPair,
-    _board: &Board,
     color: Color,
     piece: Piece,
     square: Square,
@@ -575,10 +531,10 @@ fn add_piece_features(
     net.add_feature(accumulators.for_perspective_mut(Color::Black), black);
 }
 
+#[inline(always)]
 fn remove_piece_features(
     net: &NnueNet,
     accumulators: &mut AccumulatorPair,
-    _board: &Board,
     color: Color,
     piece: Piece,
     square: Square,
@@ -589,14 +545,17 @@ fn remove_piece_features(
     net.remove_feature(accumulators.for_perspective_mut(Color::Black), black);
 }
 
+#[inline(always)]
 fn piece_index(piece: Piece) -> usize {
     usize::from(piece) - 1
 }
 
+#[inline(always)]
 fn move_from(mv: Move) -> Square {
     mv.from().expect("standard chess move has an origin square")
 }
 
+#[inline(always)]
 fn relative_square(square: Square, perspective: Color) -> Square {
     match perspective {
         Color::White => square,
@@ -616,6 +575,7 @@ fn remove_bootstrap_feature(accumulator: &mut Accumulator, feature: usize) {
     accumulator.values[hidden] = accumulator.values[hidden].saturating_sub(1);
 }
 
+#[inline(always)]
 fn screlu_i16(value: i16) -> i32 {
     let value = i32::from(value).clamp(0, QA);
     value * value
@@ -623,7 +583,9 @@ fn screlu_i16(value: i16) -> i32 {
 
 fn en_passant_captured_square(mv: Move, moving_color: Color) -> Square {
     let offset = if moving_color == Color::White { -8 } else { 8 };
-    mv.to().offset(offset).expect("en passant capture stays on board")
+    mv.to()
+        .offset(offset)
+        .expect("en passant capture stays on board")
 }
 
 fn castle_target_squares(mv: Move, moving_color: Color) -> (Square, Square) {
@@ -960,4 +922,3 @@ mod tests {
         assert_eq!(nnue_position.evaluate(), evaluate(&position));
     }
 }
-
