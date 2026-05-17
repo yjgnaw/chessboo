@@ -1170,6 +1170,10 @@ fn annotate_line(line: &str, options: AnnotationOptions) -> Option<String> {
 fn run_packnet(args: &[String]) -> Result<(), String> {
     let checkpoint = value_after(args, "--checkpoint").ok_or("packnet needs --checkpoint <dir>")?;
     let out = value_after(args, "--out").ok_or("packnet needs --out <path>")?;
+    let requested_format = value_after(args, "--format")
+        .map(|value| parse_packnet_format(&value))
+        .transpose()?
+        .flatten();
     let checkpoint = Path::new(&checkpoint);
     let quantised = checkpoint.join("quantised.bin");
     if quantised.exists() {
@@ -1183,28 +1187,33 @@ fn run_packnet(args: &[String]) -> Result<(), String> {
         }
         let bytes = fs::read(&quantised)
             .map_err(|err| format!("could not read `{}`: {err}", quantised.display()))?;
-        let expected: usize = nnue::dense_section_lengths()
-            .into_iter()
-            .map(|(_, len)| len)
-            .sum();
-        if bytes.len() >= expected && bytes.len() - expected < 64 {
-            if let Some(parent) = Path::new(&out).parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("could not create `{}`: {err}", parent.display()))?;
+        for format in packnet_candidates(requested_format) {
+            let expected = packnet_payload_len(format);
+            if bytes.len() >= expected && bytes.len() - expected < 64 {
+                if let Some(parent) = Path::new(&out).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)
+                        .map_err(|err| format!("could not create `{}`: {err}", parent.display()))?;
+                }
+                write_packnet_payload(format, &bytes[..expected], &out)
+                    .map_err(|err| err.to_string())?;
+                println!(
+                    "packnet wrapped Bullet {} quantised payload {}",
+                    format.name(),
+                    quantised.display()
+                );
+                return run_netcheck(&["--file".to_string(), out]);
             }
-            nnue::write_dense_payload(&bytes[..expected], &out).map_err(|err| err.to_string())?;
-            println!(
-                "packnet wrapped Bullet quantised payload {}",
-                quantised.display()
-            );
-            return run_netcheck(&["--file".to_string(), out]);
         }
     }
 
+    let format = match requested_format {
+        Some(format) => format,
+        None => detect_packnet_section_format(checkpoint)?,
+    };
     let mut payload = Vec::new();
-    for (name, expected_len) in nnue::dense_section_lengths() {
+    for (name, expected_len) in format.section_lengths() {
         let path = checkpoint.join(name);
         let bytes =
             fs::read(&path).map_err(|err| format!("could not read `{}`: {err}", path.display()))?;
@@ -1224,9 +1233,96 @@ fn run_packnet(args: &[String]) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("could not create `{}`: {err}", parent.display()))?;
     }
-    nnue::write_dense_payload(&payload, &out).map_err(|err| err.to_string())?;
-    println!("packnet wrote {out}");
+    write_packnet_payload(format, &payload, &out).map_err(|err| err.to_string())?;
+    println!("packnet wrote {} {out}", format.name());
     run_netcheck(&["--file".to_string(), out])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackNetFormat {
+    V1,
+    V2,
+}
+
+impl PackNetFormat {
+    fn name(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    fn section_lengths(self) -> [(&'static str, usize); 4] {
+        match self {
+            Self::V1 => nnue::dense_section_lengths(),
+            Self::V2 => nnue::output_bucket_section_lengths(),
+        }
+    }
+}
+
+fn parse_packnet_format(value: &str) -> Result<Option<PackNetFormat>, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "v1" | "dense" => Ok(Some(PackNetFormat::V1)),
+        "v2" | "output-buckets" | "output_buckets" => Ok(Some(PackNetFormat::V2)),
+        _ => Err("packnet --format must be auto, v1, or v2".to_string()),
+    }
+}
+
+fn packnet_candidates(requested: Option<PackNetFormat>) -> Vec<PackNetFormat> {
+    requested.map_or_else(
+        || vec![PackNetFormat::V2, PackNetFormat::V1],
+        |format| vec![format],
+    )
+}
+
+fn packnet_payload_len(format: PackNetFormat) -> usize {
+    format
+        .section_lengths()
+        .into_iter()
+        .map(|(_, len)| len)
+        .sum()
+}
+
+fn write_packnet_payload(
+    format: PackNetFormat,
+    payload: &[u8],
+    out: impl AsRef<Path>,
+) -> Result<(), nnue::NnueError> {
+    match format {
+        PackNetFormat::V1 => nnue::write_dense_payload(payload, out),
+        PackNetFormat::V2 => nnue::write_output_bucket_payload(payload, out),
+    }
+}
+
+fn detect_packnet_section_format(checkpoint: &Path) -> Result<PackNetFormat, String> {
+    let l0w = checkpoint.join("l0w.bin");
+    let len = fs::metadata(&l0w)
+        .map_err(|err| format!("could not read `{}`: {err}", l0w.display()))?
+        .len() as usize;
+    let mut v1_l0w = 0;
+    let mut v2_l0w = 0;
+    for format in [PackNetFormat::V2, PackNetFormat::V1] {
+        let expected = format
+            .section_lengths()
+            .into_iter()
+            .find(|(name, _)| *name == "l0w.bin")
+            .map(|(_, len)| len)
+            .expect("l0w section exists");
+        match format {
+            PackNetFormat::V1 => v1_l0w = expected,
+            PackNetFormat::V2 => v2_l0w = expected,
+        }
+        if len == expected {
+            return Ok(format);
+        }
+    }
+    Err(format!(
+        "`{}` has {len} bytes; expected {} for v1 or {} for v2",
+        l0w.display(),
+        v1_l0w,
+        v2_l0w
+    ))
 }
 
 fn run_netcheck(args: &[String]) -> Result<(), String> {
@@ -1593,7 +1689,7 @@ Usage:
   chessboo labelbinpack --in <raw.binpack> --out <quiet.binpack> [--nodes <n>] [--threads <n>] [--quiet-threshold <cp>] [--min-ply <n>] [--max-abs-score <cp>] [--limit <n>] [--use-input-labels]
   chessboo countbinpack --in <raw.binpack> [--batch-size <n>]
   chessboo augment --in <path> --out <path> [--samples <n>] [--plies <n>] [--max-input <n>] [--include-root] [--include-prefixes]
-  chessboo packnet --checkpoint <dir> --out nets/chessboo-v1.nnue
+  chessboo packnet --checkpoint <dir> --out nets/chessboo-v1.nnue [--format auto|v1|v2]
   chessboo netcheck --file <path> [--dataset <text-labels> | --binpack-dataset <viri.binpack>] [--limit <n>]",
         version = chessboo::ENGINE_VERSION
     );

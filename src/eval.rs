@@ -1,4 +1,4 @@
-use shakmaty::{attacks, Bitboard as BitBoard, Board, Color, File, Rank, Role as Piece, Square};
+use shakmaty::{Bitboard as BitBoard, Board, Color, File, Rank, Role as Piece, Square, attacks};
 
 use crate::position::Position;
 
@@ -66,7 +66,9 @@ fn colored_pieces(board: &Board, color: Color, piece: Piece) -> BitBoard {
 }
 
 fn king_square(board: &Board, color: Color) -> Square {
-    board.king_of(color).expect("standard chess position has a king")
+    board
+        .king_of(color)
+        .expect("standard chess position has a king")
 }
 
 fn piece_index(piece: Piece) -> usize {
@@ -185,7 +187,8 @@ fn piece_activity(board: &Board, color: Color) -> Score {
         }
     }
     for queen in colored_pieces(board, color, Piece::Queen) {
-        let mobility = ((attacks::rook_attacks(queen, blockers) | attacks::bishop_attacks(queen, blockers))
+        let mobility = ((attacks::rook_attacks(queen, blockers)
+            | attacks::bishop_attacks(queen, blockers))
             & !own)
             .count() as i32;
         score.mg += mobility;
@@ -266,7 +269,9 @@ fn non_king_material(board: &Board, color: Color) -> i32 {
         .iter()
         .copied()
         .filter(|&piece| piece != Piece::King)
-        .map(|piece| EG_VALUE[piece_index(piece)] * colored_pieces(board, color, piece).count() as i32)
+        .map(|piece| {
+            EG_VALUE[piece_index(piece)] * colored_pieces(board, color, piece).count() as i32
+        })
         .sum()
 }
 
@@ -297,7 +302,8 @@ fn attacks_by(board: &Board, color: Color) -> BitBoard {
         attacks |= attacks::rook_attacks(rook, blockers);
     }
     for queen in colored_pieces(board, color, Piece::Queen) {
-        attacks |= attacks::rook_attacks(queen, blockers) | attacks::bishop_attacks(queen, blockers);
+        attacks |=
+            attacks::rook_attacks(queen, blockers) | attacks::bishop_attacks(queen, blockers);
     }
     attacks | attacks::king_attacks(king_square(board, color))
 }
@@ -364,5 +370,3 @@ mod tests {
         assert!(evaluate(&edge) > evaluate(&center));
     }
 }
-
-

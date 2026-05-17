@@ -7,14 +7,14 @@
   A~~n original~~ UCI-compliant chess engine written in Rust.
 </div>
 
-It features a custom alpha-beta search, time management, Syzygy tablebase probing, and supports classical evaluation as well as NNUE.
+It features a custom alpha-beta search, time management, Syzygy tablebase probing, and NNUE evaluation with a classical fallback.
 
 ## Features
 
 - **Search**: Iterative deepening, fail-soft negamax, Alpha-Beta, Principal Variation Search (PVS), Quiescence Search, and Lazy-SMP multi-threading.
 - **Heuristics**: Null Move Pruning, Reverse Futility Pruning, ProbCut, Late Move Reductions (LMR), Late Move Pruning, SEE-based capture ordering, and History Heuristics.
 - **Evaluation**:
-  - NNUE evaluation (`(768 -> 128)x2 -> 1` architecture).
+  - Embedded NNUE v2 evaluation (`(768 -> 512)x2 -> 8 output buckets`, selected by material count).
   - Tapered classical evaluation (material, piece-square tables, mobility, pawn structure, king safety).
 - **Tablebases**: Full Syzygy WDL/DTZ tablebase probing support.
 - **UCI Protocol**: Fully compliant, supporting GUI integration, multi-threading, pondering, and rich configuration options.
@@ -48,6 +48,6 @@ You can configure Chessboo through the GUI or directly via UCI commands. Availab
 - `Threads`: Number of search threads (Lazy SMP).
 - `SyzygyPath`: Path to your downloaded Syzygy WDL/DTZ files.
 - `SyzygyProbeDepth` / `SyzygyProbeLimit` / `Syzygy50MoveRule`: Advanced tablebase probing configuration.
-- `Use NNUE`: Toggle the NNUE evaluator.
-- `EvalFile`: Path to an external `.nnue` file.
+- `Use NNUE`: Toggle the NNUE evaluator. If disabled, Chessboo uses classical evaluation.
+- `EvalFile`: Path to an external `.nnue` file, or `<internal>` to use the embedded v2 net (`nets/chessboo-v2.nnue`).
 - `Move Overhead`: Configurable safety margin for time management in milliseconds.

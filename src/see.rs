@@ -1,4 +1,4 @@
-use shakmaty::{attacks, Bitboard as BitBoard, Board, Color, Move, Rank, Role as Piece, Square};
+use shakmaty::{Bitboard as BitBoard, Board, Color, Move, Rank, Role as Piece, Square, attacks};
 
 use crate::eval::piece_value;
 use crate::position::Position;
@@ -132,7 +132,9 @@ fn attackers_for_piece(
         Piece::Bishop => {
             attacks::bishop_attacks(target, occupied) & side_pieces[piece_index(Piece::Bishop)]
         }
-        Piece::Rook => attacks::rook_attacks(target, occupied) & side_pieces[piece_index(Piece::Rook)],
+        Piece::Rook => {
+            attacks::rook_attacks(target, occupied) & side_pieces[piece_index(Piece::Rook)]
+        }
         Piece::Queen => {
             (attacks::bishop_attacks(target, occupied) | attacks::rook_attacks(target, occupied))
                 & side_pieces[piece_index(Piece::Queen)]
@@ -322,5 +324,3 @@ mod tests {
         assert!(static_exchange_eval(&position, mv) < -500);
     }
 }
-
-

@@ -13,17 +13,21 @@ use crate::position::Position;
 const PIECE_COUNT: usize = 6;
 
 pub const FEATURE_COUNT: usize = 2 * PIECE_COUNT * 64;
-pub const HIDDEN_SIZE: usize = 128;
-pub const LAYER1_SIZE: usize = 2 * HIDDEN_SIZE;
+pub const V1_HIDDEN_SIZE: usize = 128;
+pub const V2_HIDDEN_SIZE: usize = 512;
+pub const V2_OUTPUT_BUCKETS: usize = 8;
+pub const HIDDEN_SIZE: usize = V1_HIDDEN_SIZE;
+pub const LAYER1_SIZE: usize = 2 * V1_HIDDEN_SIZE;
 pub const LAYER2_SIZE: usize = 0;
 pub const SCALE: i32 = 400;
 pub const QA: i32 = 255;
 pub const QB: i32 = 64;
 pub const INTERNAL_EVAL_FILE: &str = "<internal>";
 
+const MAX_HIDDEN_SIZE: usize = V2_HIDDEN_SIZE;
 const TEXT_MAGIC: &str = "CHESSBOO_NNUE_BOOTSTRAP_V1";
 const BINARY_MAGIC: &[u8; 8] = b"CBNNUE01";
-const EMBEDDED_NET: &[u8] = include_bytes!("../nets/chessboo-v1.nnue");
+const EMBEDDED_NET: &[u8] = include_bytes!("../nets/chessboo-v2.nnue");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NnueError(String);
@@ -57,15 +61,17 @@ enum NnueWeights {
 
 #[derive(Debug)]
 struct DenseWeights {
+    hidden_size: usize,
+    output_buckets: usize,
     l0_weights: Vec<i16>,
-    l0_bias: [i16; HIDDEN_SIZE],
+    l0_bias: Vec<i16>,
     output_weights: Vec<i16>,
-    output_bias: i16,
+    output_bias: Vec<i16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accumulator {
-    values: [i16; HIDDEN_SIZE],
+    values: [i16; MAX_HIDDEN_SIZE],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,11 +132,24 @@ impl NnueNet {
         match &self.weights {
             NnueWeights::Bootstrap => Ok(()),
             NnueWeights::Dense(weights) => {
-                if weights.l0_weights.len() != FEATURE_COUNT * HIDDEN_SIZE {
+                if weights.hidden_size == 0 || weights.hidden_size > MAX_HIDDEN_SIZE {
+                    return Err(NnueError("invalid hidden size".to_string()));
+                }
+                if weights.output_buckets == 0 {
+                    return Err(NnueError("invalid output bucket count".to_string()));
+                }
+                if weights.l0_weights.len() != FEATURE_COUNT * weights.hidden_size {
                     return Err(NnueError("invalid l0 weight count".to_string()));
                 }
-                if weights.output_weights.len() != LAYER1_SIZE {
+                if weights.l0_bias.len() != weights.hidden_size {
+                    return Err(NnueError("invalid l0 bias count".to_string()));
+                }
+                if weights.output_weights.len() != 2 * weights.hidden_size * weights.output_buckets
+                {
                     return Err(NnueError("invalid output weight count".to_string()));
+                }
+                if weights.output_bias.len() != weights.output_buckets {
+                    return Err(NnueError("invalid output bias count".to_string()));
                 }
                 Ok(())
             }
@@ -157,7 +176,7 @@ impl NnueNet {
     ) -> i32 {
         match &self.weights {
             NnueWeights::Bootstrap => evaluate(position),
-            NnueWeights::Dense(weights) => weights.evaluate(side_to_move, accumulators),
+            NnueWeights::Dense(weights) => weights.evaluate(side_to_move, accumulators, position),
         }
     }
 
@@ -191,27 +210,45 @@ impl NnueNet {
         let qb = reader.read_i32()?;
         let stored_checksum = reader.read_u64()?;
 
-        if version != 1 {
-            return Err(NnueError(format!("unsupported NNUE version {version}")));
-        }
-        if feature_count != FEATURE_COUNT
-            || hidden != HIDDEN_SIZE
-            || layer1 != LAYER1_SIZE
-            || layer2 != LAYER2_SIZE
-            || scale != SCALE
-            || qa != QA
-            || qb != QB
-        {
-            return Err(NnueError(
-                "NNUE architecture does not match Chessboo v1".to_string(),
-            ));
-        }
+        let output_buckets = match version {
+            1 => {
+                if feature_count != FEATURE_COUNT
+                    || hidden != V1_HIDDEN_SIZE
+                    || layer1 != 2 * V1_HIDDEN_SIZE
+                    || layer2 != LAYER2_SIZE
+                    || scale != SCALE
+                    || qa != QA
+                    || qb != QB
+                {
+                    return Err(NnueError(
+                        "NNUE architecture does not match Chessboo v1".to_string(),
+                    ));
+                }
+                1
+            }
+            2 => {
+                if feature_count != FEATURE_COUNT
+                    || hidden != V2_HIDDEN_SIZE
+                    || layer1 != 2 * V2_HIDDEN_SIZE
+                    || layer2 != V2_OUTPUT_BUCKETS
+                    || scale != SCALE
+                    || qa != QA
+                    || qb != QB
+                {
+                    return Err(NnueError(
+                        "NNUE architecture does not match Chessboo v2".to_string(),
+                    ));
+                }
+                V2_OUTPUT_BUCKETS
+            }
+            _ => return Err(NnueError(format!("unsupported NNUE version {version}"))),
+        };
 
         let checksum_start = reader.position();
-        let l0_weights = reader.read_i16_vec(FEATURE_COUNT * HIDDEN_SIZE)?;
-        let l0_bias = reader.read_i16_array::<HIDDEN_SIZE>()?;
-        let output_weights = reader.read_i16_vec(LAYER1_SIZE)?;
-        let output_bias = reader.read_i16()?;
+        let l0_weights = reader.read_i16_vec(FEATURE_COUNT * hidden)?;
+        let l0_bias = reader.read_i16_vec(hidden)?;
+        let output_weights = reader.read_i16_vec(layer1 * output_buckets)?;
+        let output_bias = reader.read_i16_vec(output_buckets)?;
         if !reader.is_finished() {
             return Err(NnueError("NNUE file has trailing bytes".to_string()));
         }
@@ -224,6 +261,8 @@ impl NnueNet {
             source,
             checksum: actual_checksum,
             weights: NnueWeights::Dense(Box::new(DenseWeights {
+                hidden_size: hidden,
+                output_buckets,
                 l0_weights,
                 l0_bias,
                 output_weights,
@@ -238,43 +277,74 @@ impl NnueNet {
 impl DenseWeights {
     #[inline(always)]
     fn add_feature(&self, accumulator: &mut Accumulator, feature: usize) {
-        let offset = feature * HIDDEN_SIZE;
-        for index in 0..HIDDEN_SIZE {
-            accumulator.values[index] += self.l0_weights[offset + index];
+        let offset = feature * self.hidden_size;
+        let weights = &self.l0_weights[offset..offset + self.hidden_size];
+        for (value, weight) in accumulator.values[..self.hidden_size]
+            .iter_mut()
+            .zip(weights)
+        {
+            *value += *weight;
         }
     }
 
     #[inline(always)]
     fn remove_feature(&self, accumulator: &mut Accumulator, feature: usize) {
-        let offset = feature * HIDDEN_SIZE;
-        for index in 0..HIDDEN_SIZE {
-            accumulator.values[index] -= self.l0_weights[offset + index];
+        let offset = feature * self.hidden_size;
+        let weights = &self.l0_weights[offset..offset + self.hidden_size];
+        for (value, weight) in accumulator.values[..self.hidden_size]
+            .iter_mut()
+            .zip(weights)
+        {
+            *value -= *weight;
         }
     }
 
     #[inline(always)]
-    fn evaluate(&self, side_to_move: Color, accumulators: &AccumulatorPair) -> i32 {
+    fn evaluate(
+        &self,
+        side_to_move: Color,
+        accumulators: &AccumulatorPair,
+        position: &Position,
+    ) -> i32 {
         let (us, them) = accumulators.by_side(side_to_move);
+        let bucket = self.output_bucket(position);
+        let weights = &self.output_weights
+            [bucket * 2 * self.hidden_size..(bucket + 1) * 2 * self.hidden_size];
         let mut output = 0_i64;
-        for hidden in 0..HIDDEN_SIZE {
-            let us_value = screlu_i16(us.values[hidden]);
-            output += i64::from(us_value) * i64::from(self.output_weights[hidden]);
+        for (value, weight) in us.values[..self.hidden_size]
+            .iter()
+            .zip(&weights[..self.hidden_size])
+        {
+            output += i64::from(screlu_i16(*value)) * i64::from(*weight);
         }
-        for hidden in 0..HIDDEN_SIZE {
-            let them_value = screlu_i16(them.values[hidden]);
-            output += i64::from(them_value) * i64::from(self.output_weights[HIDDEN_SIZE + hidden]);
+        for (value, weight) in them.values[..self.hidden_size]
+            .iter()
+            .zip(&weights[self.hidden_size..])
+        {
+            output += i64::from(screlu_i16(*value)) * i64::from(*weight);
         }
         output /= i64::from(QA);
-        output += i64::from(self.output_bias);
+        output += i64::from(self.output_bias[bucket]);
         (output * i64::from(SCALE) / i64::from(QA * QB))
             .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+
+    #[inline(always)]
+    fn output_bucket(&self, position: &Position) -> usize {
+        if self.output_buckets == 1 {
+            return 0;
+        }
+
+        let divisor = 32_usize.div_ceil(self.output_buckets);
+        let pieces = position.board().occupied().count().saturating_sub(2);
+        (pieces / divisor).min(self.output_buckets - 1)
     }
 }
 
 impl Accumulator {
     fn zeroed() -> Self {
         Self {
-            values: [0; HIDDEN_SIZE],
+            values: [0; MAX_HIDDEN_SIZE],
         }
     }
 }
@@ -294,13 +364,11 @@ impl AccumulatorPair {
 
     fn dense(position: &Position, weights: &DenseWeights) -> Self {
         let mut pair = Self {
-            white: Accumulator {
-                values: weights.l0_bias,
-            },
-            black: Accumulator {
-                values: weights.l0_bias,
-            },
+            white: Accumulator::zeroed(),
+            black: Accumulator::zeroed(),
         };
+        pair.white.values[..weights.hidden_size].copy_from_slice(&weights.l0_bias);
+        pair.black.values[..weights.hidden_size].copy_from_slice(&weights.l0_bias);
         for feature in active_features(position.board()) {
             weights.add_feature(pair.for_perspective_mut(Color::White), feature.white);
             weights.add_feature(pair.for_perspective_mut(Color::Black), feature.black);
@@ -605,10 +673,19 @@ fn castle_target_squares(mv: Move, moving_color: Color) -> (Square, Square) {
 
 pub fn dense_section_lengths() -> [(&'static str, usize); 4] {
     [
-        ("l0w.bin", FEATURE_COUNT * HIDDEN_SIZE * 2),
-        ("l0b.bin", HIDDEN_SIZE * 2),
-        ("l1w.bin", LAYER1_SIZE * 2),
+        ("l0w.bin", FEATURE_COUNT * V1_HIDDEN_SIZE * 2),
+        ("l0b.bin", V1_HIDDEN_SIZE * 2),
+        ("l1w.bin", 2 * V1_HIDDEN_SIZE * 2),
         ("l1b.bin", 2),
+    ]
+}
+
+pub fn output_bucket_section_lengths() -> [(&'static str, usize); 4] {
+    [
+        ("l0w.bin", FEATURE_COUNT * V2_HIDDEN_SIZE * 2),
+        ("l0b.bin", V2_HIDDEN_SIZE * 2),
+        ("l1w.bin", V2_OUTPUT_BUCKETS * 2 * V2_HIDDEN_SIZE * 2),
+        ("l1b.bin", V2_OUTPUT_BUCKETS * 2),
     ]
 }
 
@@ -624,13 +701,53 @@ pub fn write_dense_payload(payload: &[u8], out: impl AsRef<Path>) -> Result<(), 
         )));
     }
 
+    write_binary_payload(
+        payload,
+        out,
+        1,
+        V1_HIDDEN_SIZE,
+        2 * V1_HIDDEN_SIZE,
+        LAYER2_SIZE,
+    )
+}
+
+pub fn write_output_bucket_payload(payload: &[u8], out: impl AsRef<Path>) -> Result<(), NnueError> {
+    let expected: usize = output_bucket_section_lengths()
+        .into_iter()
+        .map(|(_, len)| len)
+        .sum();
+    if payload.len() != expected {
+        return Err(NnueError(format!(
+            "output-bucket payload has {} bytes, expected {expected}",
+            payload.len()
+        )));
+    }
+
+    write_binary_payload(
+        payload,
+        out,
+        2,
+        V2_HIDDEN_SIZE,
+        2 * V2_HIDDEN_SIZE,
+        V2_OUTPUT_BUCKETS,
+    )
+}
+
+fn write_binary_payload(
+    payload: &[u8],
+    out: impl AsRef<Path>,
+    version: u32,
+    hidden_size: usize,
+    layer1_size: usize,
+    layer2_size: usize,
+) -> Result<(), NnueError> {
     let mut bytes = Vec::with_capacity(8 + 8 * 4 + 8 + payload.len());
     bytes.extend_from_slice(BINARY_MAGIC);
-    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&version.to_le_bytes());
     bytes.extend_from_slice(&(FEATURE_COUNT as u32).to_le_bytes());
-    bytes.extend_from_slice(&(HIDDEN_SIZE as u32).to_le_bytes());
-    bytes.extend_from_slice(&(LAYER1_SIZE as u32).to_le_bytes());
-    bytes.extend_from_slice(&(LAYER2_SIZE as u32).to_le_bytes());
+    bytes.extend_from_slice(&(hidden_size as u32).to_le_bytes());
+    bytes.extend_from_slice(&(layer1_size as u32).to_le_bytes());
+    bytes.extend_from_slice(&(layer2_size as u32).to_le_bytes());
     bytes.extend_from_slice(&SCALE.to_le_bytes());
     bytes.extend_from_slice(&QA.to_le_bytes());
     bytes.extend_from_slice(&QB.to_le_bytes());
@@ -693,11 +810,6 @@ impl<'a> ByteReader<'a> {
         Ok(i32::from_le_bytes(bytes))
     }
 
-    fn read_i16(&mut self) -> Result<i16, NnueError> {
-        let bytes: [u8; 2] = self.read_exact(2)?.try_into().expect("two bytes");
-        Ok(i16::from_le_bytes(bytes))
-    }
-
     fn read_u64(&mut self) -> Result<u64, NnueError> {
         let bytes: [u8; 8] = self.read_exact(8)?.try_into().expect("eight bytes");
         Ok(u64::from_le_bytes(bytes))
@@ -708,15 +820,6 @@ impl<'a> ByteReader<'a> {
         for _ in 0..len {
             let bytes: [u8; 2] = self.read_exact(2)?.try_into().expect("two bytes");
             values.push(i16::from_le_bytes(bytes));
-        }
-        Ok(values)
-    }
-
-    fn read_i16_array<const N: usize>(&mut self) -> Result<[i16; N], NnueError> {
-        let mut values = [0_i16; N];
-        for value in &mut values {
-            let bytes: [u8; 2] = self.read_exact(2)?.try_into().expect("two bytes");
-            *value = i16::from_le_bytes(bytes);
         }
         Ok(values)
     }
@@ -881,6 +984,56 @@ mod tests {
 
         let hidden = i64::from(screlu_i16(10));
         let output = (HIDDEN_SIZE as i64 * hidden * i64::from(2 + 3) / i64::from(QA)) + 5;
+        let expected = (output * i64::from(SCALE) / i64::from(QA * QB)) as i32;
+        assert_eq!(score, expected);
+    }
+
+    #[test]
+    fn output_bucket_binary_selects_material_bucket() {
+        let mut payload = Vec::new();
+        payload.extend(std::iter::repeat_n(
+            0_u8,
+            FEATURE_COUNT * V2_HIDDEN_SIZE * 2,
+        ));
+        for _ in 0..V2_HIDDEN_SIZE {
+            payload.extend_from_slice(&10_i16.to_le_bytes());
+        }
+
+        let startpos_bucket = 7;
+        for bucket in 0..V2_OUTPUT_BUCKETS {
+            let us_weight = if bucket == startpos_bucket { 2_i16 } else { 0 };
+            let them_weight = if bucket == startpos_bucket { 3_i16 } else { 0 };
+            for _ in 0..V2_HIDDEN_SIZE {
+                payload.extend_from_slice(&us_weight.to_le_bytes());
+            }
+            for _ in 0..V2_HIDDEN_SIZE {
+                payload.extend_from_slice(&them_weight.to_le_bytes());
+            }
+        }
+        for bucket in 0..V2_OUTPUT_BUCKETS {
+            let bias = if bucket == startpos_bucket { 5_i16 } else { 0 };
+            payload.extend_from_slice(&bias.to_le_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BINARY_MAGIC);
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&(FEATURE_COUNT as u32).to_le_bytes());
+        bytes.extend_from_slice(&(V2_HIDDEN_SIZE as u32).to_le_bytes());
+        bytes.extend_from_slice(&(2_u32 * V2_HIDDEN_SIZE as u32).to_le_bytes());
+        bytes.extend_from_slice(&(V2_OUTPUT_BUCKETS as u32).to_le_bytes());
+        bytes.extend_from_slice(&SCALE.to_le_bytes());
+        bytes.extend_from_slice(&QA.to_le_bytes());
+        bytes.extend_from_slice(&QB.to_le_bytes());
+        bytes.extend_from_slice(&checksum_bytes(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let net = Arc::new(NnueNet::from_bytes(&bytes, NnueSource::External).unwrap());
+        let position = Position::startpos();
+        let score = NnuePosition::new(position, Some(net)).evaluate();
+
+        let hidden = i64::from(screlu_i16(10));
+        let output = (V2_HIDDEN_SIZE as i64 * hidden * i64::from(2 + 3) / i64::from(QA)) + 5;
         let expected = (output * i64::from(SCALE) / i64::from(QA * QB)) as i32;
         assert_eq!(score, expected);
     }
